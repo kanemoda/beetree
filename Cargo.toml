@@ -1,0 +1,14 @@
+[package]
+name = "beetree"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A readable reference implementation of a Bε-tree storage engine"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"

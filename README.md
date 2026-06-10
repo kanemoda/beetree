@@ -1,1 +1,30 @@
 # beetree
+
+A readable, honestly-benchmarked reference implementation of a Bε-tree
+storage engine. The point is to be read: semantics live in an executable
+specification (`docs/SPEC.md` plus a generic property-test harness that every
+engine must pass unchanged), structural invariants are checked exhaustively
+under test, and design decisions are recorded as short ADRs in `docs/adr/`.
+There are no performance claims here, and there won't be any until there are
+honest benchmarks to back them.
+
+## Status
+
+| Milestone | Scope | Status |
+|-----------|-------|--------|
+| M0.1 | Project skeleton, SPEC, generic property-test harness, naive reference engine | done |
+| M0.2 | In-memory Bε-tree that passes the M0.1 harness unchanged | done |
+| M1 | Deletes/tombstones, upserts, range scans, copy-on-write nodes (replaces the append-only arena; ADR-0004) | planned |
+| M2 | Node merges | planned |
+
+## Build & test
+
+```sh
+cargo test                                      # unit tests + property harness
+cargo clippy --all-targets -- -D warnings       # must stay clean
+cargo fmt --check
+```
+
+The test harness (`tests/harness.rs`) is generic over the `KvEngine` trait
+and deliberately uses tiny structure parameters (F=4, B=8, L=8) to force deep
+trees and frequent structural operations.
