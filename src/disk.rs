@@ -274,6 +274,14 @@ impl<V: Vfs> DiskEngine<V> {
         self.params
     }
 
+    /// The generation of the newest committed (or recovered) state — a
+    /// non-normative observability helper, like `BeTree::height()`.
+    /// `create()` leaves it at 0; every successful commit increments it;
+    /// `open()` reports the generation it recovered.
+    pub fn generation(&self) -> u64 {
+        self.next_generation - 1
+    }
+
     /// Current length of the backing file in bytes.
     pub fn file_len(&self) -> Result<u64, DiskError> {
         Ok(self.vfs.len()?)

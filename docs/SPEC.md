@@ -132,7 +132,13 @@ tree.
   through `&self`): that holds trivially for a `create()`d engine and
   after `load_all()`; nothing evicts in M1.
 - `create_on(vfs, params)` / `open_on(vfs)` — the same over any `Vfs`
-  (the M1.2 fault-injection entry points).
+  (the M1.2 fault-injection entry points; `FaultyVfs` is the in-memory
+  crash-model implementation, ADR-0010).
+- `generation()` — non-normative observability helper (like
+  `BeTree::height()`): the newest committed or recovered generation.
+- `KvEngine::new(params)` is unsupported for `DiskEngine` — an engine
+  cannot exist without backing storage — and panics; the harness mounts
+  via a tempdir wrapper that calls `create()`.
 
 In-memory semantics (P1–P5) are unchanged between commits; `DiskEngine`
 passes the frozen harness via a thin tempdir wrapper (`tests/disk.rs`).
@@ -226,6 +232,38 @@ have half-published a generation — whether it became durable is the
 classic lost-ack ambiguity). The engine therefore refuses further commits
 with a typed `Poisoned` error; reads stay best-effort; reopening the file
 recovers the last committed state.
+
+## Crash model and guarantees (M1.2, normative)
+
+The durability contract is enforced mechanically by the crash harness
+(`tests/crash.rs`) over the crash model of ADR-0010: a crash at any point
+of the device-op history preserves everything synced by then plus an
+arbitrary subset of the un-synced window, each pending op independently
+dropped, fully applied, zero-filled over its extent, or torn to a byte
+prefix; a failed sync durably applies an arbitrary subset and discards
+the rest (fsyncgate). Under every such crash image, with oracle snapshots
+taken at each commit:
+
+- A1 — recovery succeeds: `open()` returns an engine. A typed-error
+  failure is permitted only for crashes that precede the initial
+  `create()` return (no generation was ever durably published).
+- A2 — recovery is exact: the recovered generation g is one of the
+  committed (or attempted) generations, and a full-domain sweep matches
+  generation g's oracle snapshot EXACTLY.
+- A3 — no durable commit is lost: g is at least the newest generation
+  whose commit had fully synced before the crash point (and never beyond
+  the last attempted generation).
+- A4 — recovery is structurally sound: the recovered tree passes the full
+  I1–I6 invariant checker.
+- A5 — recovery is live: the recovered engine accepts new operations,
+  commits them, and survives a further reopen with the combined state —
+  including seqno continuity (`last_seq`).
+
+Recovery is idempotent: crashing the recovery's own truncation window and
+recovering again yields the same generation. The harness itself is
+mutation-tested (docs/findings.md, "harness mutations"): deleting the
+data sync, breaking superblock-slot alternation, or skipping superblock
+CRC verification must each make it fail.
 
 ## Out of scope in M0
 

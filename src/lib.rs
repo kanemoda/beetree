@@ -31,4 +31,4 @@ pub use trace::{OpKind, TraceEvent, from_jsonl, replay, to_jsonl};
 pub use types::{CapacityKind, InvariantViolation, Key, Message, Params, Value};
 #[cfg(unix)]
 pub use vfs::FileVfs;
-pub use vfs::Vfs;
+pub use vfs::{Fate, FaultyVfs, Vfs, VfsOp};

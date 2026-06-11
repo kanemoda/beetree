@@ -414,7 +414,14 @@ fn commit_stats_track_dirty_spine() {
     );
 
     engine.insert(vec![1], vec![2]);
+    let before = engine.file_len().unwrap();
     let spine = engine.commit().unwrap();
+    let after = engine.file_len().unwrap();
+    assert_eq!(
+        spine.bytes_written,
+        (after - before) + 4096,
+        "bytes_written is exactly the data-region growth plus the superblock slot"
+    );
     assert!(
         spine.nodes_written > 0,
         "the insert dirtied at least the root"
@@ -433,6 +440,10 @@ fn commit_stats_track_dirty_spine() {
 
     let empty = engine.commit().unwrap();
     assert_eq!(empty.nodes_written, 0, "nothing was dirty");
+    assert_eq!(
+        empty.bytes_written, 4096,
+        "an op-free commit writes exactly one superblock slot"
+    );
 
     // The op-free commit still advanced a generation; everything reopens,
     // and committing a freshly opened, untouched engine (root not even
@@ -472,6 +483,61 @@ fn create_and_open_reject_bad_files() {
     std::fs::write(&garbage, vec![0xa5u8; 32 * 1024]).unwrap();
     assert!(matches!(
         DiskEngine::open(&garbage).expect_err("garbage has no valid superblock"),
+        DiskError::NoValidSuperblock
+    ));
+}
+
+/// Seqnos continue across reopen (the superblock's `last_seq`): the first
+/// op of a new session gets exactly `last committed seqno + 1`, so
+/// cross-session last-writer-wins ordering and I3 stay sound.
+#[test]
+fn seqnos_continue_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = DiskEngine::create(db_path(&dir), Params::default()).unwrap();
+    for i in 0..300u32 {
+        engine.insert(vec![(i % 50) as u8], i.to_be_bytes().to_vec());
+    }
+    engine.commit().unwrap();
+    drop(engine);
+
+    let mut engine = DiskEngine::open(db_path(&dir)).unwrap();
+    engine.insert(vec![7], b"after reopen".to_vec());
+    let first_seq = engine
+        .trace()
+        .iter()
+        .find_map(|e| match e {
+            beetree::TraceEvent::Op { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .expect("the insert was traced");
+    assert_eq!(
+        first_seq, 301,
+        "the new session must continue the persisted seqno sequence"
+    );
+    assert_eq!(engine.get(&[7]), Some(b"after reopen".to_vec()));
+    engine.load_all().unwrap();
+    engine.check_invariants().unwrap();
+}
+
+/// A real database with BOTH superblock slots corrupted must fail open()
+/// with the typed NoValidSuperblock — not fall back to garbage.
+#[test]
+fn both_slots_corrupted_is_no_valid_superblock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(&dir);
+    let mut engine = DiskEngine::create(&path, Params::default()).unwrap();
+    for b in 0..=255u8 {
+        engine.insert(vec![b], vec![b]);
+    }
+    engine.commit().unwrap();
+    drop(engine);
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[100] ^= 0x01; // slot 0
+    bytes[4096 + 100] ^= 0x01; // slot 1
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(matches!(
+        DiskEngine::open(&path).expect_err("both slots are corrupt"),
         DiskError::NoValidSuperblock
     ));
 }
