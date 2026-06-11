@@ -144,3 +144,9 @@ their kills probabilistic or impossible:
   harness — new file, new hash, recorded rationale — and is deferred to a
   polish milestone so it can ride along with any other accumulated
   freeze-debt in a single, auditable break.
+- **drain() is deliberately invisible to traces** (recorded M3.1): the
+  frozen-matched trace enums cannot gain a Drain/FlushDecision-suppressing
+  variant (CLAUDE.md standing rule, learned from ADR-0013), and drain is in
+  any case OUTSIDE the performance model (SPEC "Observability") — its
+  forced flushes are not policy decisions and must not contaminate
+  recorded FlushDecision streams. So drain emits no trace events at all.

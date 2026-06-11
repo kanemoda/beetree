@@ -409,11 +409,19 @@ fn tear_grid() -> Vec<Fate> {
 
 /// Run one full crash case: workload, oracle snapshots, crash points,
 /// images, idempotent recovery.
-fn run_case(case: &CrashCase, images: &AtomicU64, a2_via_scan: bool) -> Result<(), TestCaseError> {
+fn run_case(
+    case: &CrashCase,
+    images: &AtomicU64,
+    a2_via_scan: bool,
+    cache_budget: Option<u64>,
+) -> Result<(), TestCaseError> {
     let vfs = FaultyVfs::new();
     let h = vfs.clone();
-    let mut engine = DiskEngine::create_on(vfs, Params::default())
-        .map_err(|e| TestCaseError::fail(format!("create failed: {e}")))?;
+    let mut engine = match cache_budget {
+        Some(budget) => DiskEngine::create_on_bounded(vfs, Params::default(), budget),
+        None => DiskEngine::create_on(vfs, Params::default()),
+    }
+    .map_err(|e| TestCaseError::fail(format!("create failed: {e}")))?;
     let create_done = h.log_len();
 
     let mut oracle: BTreeMap<Key, Value> = BTreeMap::new();
@@ -533,7 +541,12 @@ fn run_case(case: &CrashCase, images: &AtomicU64, a2_via_scan: bool) -> Result<(
     Ok(())
 }
 
-fn run_crash_suite(name: &str, strategy: impl Strategy<Value = CrashCase>, a2_via_scan: bool) {
+fn run_crash_suite(
+    name: &str,
+    strategy: impl Strategy<Value = CrashCase>,
+    a2_via_scan: bool,
+    cache_budget: Option<u64>,
+) {
     let images = AtomicU64::new(0);
     let mut config = Config {
         cases: cases_budget(),
@@ -541,7 +554,9 @@ fn run_crash_suite(name: &str, strategy: impl Strategy<Value = CrashCase>, a2_vi
     };
     config.failure_persistence = None;
     let mut runner = TestRunner::new(config);
-    let result = runner.run(&strategy, |case| run_case(&case, &images, a2_via_scan));
+    let result = runner.run(&strategy, |case| {
+        run_case(&case, &images, a2_via_scan, cache_budget)
+    });
     println!(
         "{name}: crash images evaluated: {}",
         images.load(Ordering::Relaxed)
@@ -553,17 +568,32 @@ fn run_crash_suite(name: &str, strategy: impl Strategy<Value = CrashCase>, a2_vi
 
 #[test]
 fn crash_random_workloads() {
-    run_crash_suite("crash_random_workloads", crash_case(random_body()), false);
+    run_crash_suite(
+        "crash_random_workloads",
+        crash_case(random_body()),
+        false,
+        None,
+    );
 }
 
 #[test]
 fn crash_ascending_keys() {
-    run_crash_suite("crash_ascending_keys", crash_case(ascending_body()), false);
+    run_crash_suite(
+        "crash_ascending_keys",
+        crash_case(ascending_body()),
+        false,
+        None,
+    );
 }
 
 #[test]
 fn crash_overwrite_heavy() {
-    run_crash_suite("crash_overwrite_heavy", crash_case(overwrite_body()), false);
+    run_crash_suite(
+        "crash_overwrite_heavy",
+        crash_case(overwrite_body()),
+        false,
+        None,
+    );
 }
 
 #[test]
@@ -575,6 +605,7 @@ fn crash_delete_heavy() {
             1 => delete_all_body(),
         ]),
         false,
+        None,
     );
 }
 
@@ -591,12 +622,36 @@ fn crash_scan_first_recovery() {
             1 => upsert_heavy_body(),
         ]),
         true,
+        None,
+    );
+}
+
+/// Eviction interleaved with commits and crash images (M3.1): a
+/// 4096-byte cache budget on the workload engine. A1–A5 are unchanged —
+/// eviction must be invisible to durability (evicted nodes are clean by
+/// definition; their records are already exactly what recovery reads).
+#[test]
+fn crash_tiny_cache() {
+    run_crash_suite(
+        "crash_tiny_cache",
+        crash_case(prop_oneof![
+            2 => random_body(),
+            1 => delete_heavy_body(),
+            1 => upsert_heavy_body(),
+        ]),
+        false,
+        Some(4096),
     );
 }
 
 #[test]
 fn crash_upsert_heavy() {
-    run_crash_suite("crash_upsert_heavy", crash_case(upsert_heavy_body()), false);
+    run_crash_suite(
+        "crash_upsert_heavy",
+        crash_case(upsert_heavy_body()),
+        false,
+        None,
+    );
 }
 
 // ---------------------------------------------------------------------

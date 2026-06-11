@@ -81,6 +81,15 @@ impl BeTree {
         self.nodes.len()
     }
 
+    /// Force-flush every buffer until the whole tree is message-free
+    /// (SPEC "Observability"): a benchmarking/analysis utility OUTSIDE
+    /// the performance model. Its internal flushes are NOT traced — no
+    /// FlushDecision events (docs/findings.md) — so never call it
+    /// mid-workload when recording traces for policy analysis.
+    pub fn drain(&mut self) {
+        self.restore_root_with(0, false);
+    }
+
     fn alloc(&mut self, node: Node) -> NodeId {
         let id = self.nodes.len() as NodeId;
         self.nodes.push(node);
@@ -93,10 +102,16 @@ impl BeTree {
     /// piece sits at the same depth as the old root, so a new root above
     /// them keeps all leaves at uniform depth (I6).
     fn restore_root(&mut self) {
+        self.restore_root_with(self.params.buffer_capacity, true);
+    }
+
+    /// The settling loop behind both public-op tails (`threshold` = B,
+    /// traced) and [`BeTree::drain`] (`threshold` = 0, untraced).
+    fn restore_root_with(&mut self, threshold: usize, trace_flushes: bool) {
         loop {
             let root_is_internal = matches!(&self.nodes[self.root as usize], Node::Internal { .. });
             let outcome = if root_is_internal {
-                self.flush_overfull(self.root)
+                self.flush_with(self.root, threshold, trace_flushes)
             } else {
                 Outcome::Splits(self.split_if_needed(self.root))
             };
@@ -159,7 +174,7 @@ impl BeTree {
     /// tree height, and legal-but-degenerate parameters make height linear
     /// in the number of inserts (F=2 under sorted insertion; `docs/SPEC.md`,
     /// "Structure parameters"), which would overflow the call stack.
-    fn flush_overfull(&mut self, id: NodeId) -> Outcome {
+    fn flush_with(&mut self, id: NodeId, threshold: usize, trace_flushes: bool) -> Outcome {
         // Nodes currently flushing, cascade root first. A node below the
         // top of the stack is waiting for its overfull child above it.
         let mut flushing: Vec<NodeId> = vec![id];
@@ -167,7 +182,26 @@ impl BeTree {
             let top = *flushing
                 .last()
                 .expect("the flush stack only empties via the return below");
-            if self.buffer_len(top) <= self.params.buffer_capacity {
+            if self.buffer_len(top) <= threshold {
+                if threshold == 0 {
+                    // Drain mode: a delivery-driven cascade never visits a
+                    // child the parent holds no messages for, so descend
+                    // into any child whose SUBTREE still holds resting
+                    // messages (the child's own buffer may be empty above
+                    // a buffered descendant); the flushing stack wires its
+                    // outcome to `top` as usual.
+                    let buffered_child = match &self.nodes[top as usize] {
+                        Node::Internal { children, .. } => children
+                            .iter()
+                            .copied()
+                            .find(|&c| self.subtree_has_messages(c)),
+                        Node::Leaf { .. } => None,
+                    };
+                    if let Some(child) = buffered_child {
+                        flushing.push(child);
+                        continue;
+                    }
+                }
                 // `top` is done: hand its outcome to the frame below (its
                 // parent in the cascade), or to the caller for the
                 // cascade root.
@@ -183,8 +217,10 @@ impl BeTree {
                 continue;
             }
             let (chosen, child_id, child_occupancies, batch) = self.pick_and_extract(top);
-            self.trace.flush_decision(top, child_occupancies, chosen);
-            match self.apply_batch(child_id, batch) {
+            if trace_flushes {
+                self.trace.flush_decision(top, child_occupancies, chosen);
+            }
+            match self.apply_batch(child_id, batch, threshold) {
                 Delivery::Internal { overflowed: true } => {
                     // The child's buffer now overflows too: flush it to
                     // completion before continuing with `top`.
@@ -205,6 +241,23 @@ impl BeTree {
                 }
             }
         }
+    }
+
+    /// Drain-mode probe: does any buffer in `id`'s subtree hold messages?
+    fn subtree_has_messages(&self, id: NodeId) -> bool {
+        let mut stack = vec![id];
+        while let Some(n) = stack.pop() {
+            if let Node::Internal {
+                buffer, children, ..
+            } = &self.nodes[n as usize]
+            {
+                if !buffer.is_empty() {
+                    return true;
+                }
+                stack.extend(children.iter().copied());
+            }
+        }
+        false
     }
 
     /// A flushed node's parting word to its parent: [`Outcome::Removed`]
@@ -301,7 +354,12 @@ impl BeTree {
     /// the message kinds — tombstones annihilate; internal: coalesce into
     /// the buffer per the normative table) and report what the delivery
     /// did, so the flush loop can split, recurse, or reclaim.
-    fn apply_batch(&mut self, child_id: NodeId, batch: BTreeMap<Key, Message>) -> Delivery {
+    fn apply_batch(
+        &mut self,
+        child_id: NodeId,
+        batch: BTreeMap<Key, Message>,
+        threshold: usize,
+    ) -> Delivery {
         match &mut self.nodes[child_id as usize] {
             Node::Leaf { entries } => {
                 for (key, message) in batch {
@@ -316,7 +374,7 @@ impl BeTree {
                     coalesce_into(buffer, key, message);
                 }
                 Delivery::Internal {
-                    overflowed: buffer.len() > self.params.buffer_capacity,
+                    overflowed: buffer.len() > threshold,
                 }
             }
         }
@@ -1056,6 +1114,19 @@ mod m22_tests {
         path
     }
 
+    /// Every reachable node, root first.
+    fn reachable(tree: &BeTree) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack = vec![tree.root];
+        while let Some(id) = stack.pop() {
+            out.push(id);
+            if let Node::Internal { children, .. } = &tree.nodes[id as usize] {
+                stack.extend(children.iter().copied());
+            }
+        }
+        out
+    }
+
     /// Drain every internal buffer on `key`'s path (white-box scaffolding;
     /// see `m21_tests`).
     fn drain_path_buffers(tree: &mut BeTree, key: &[u8]) {
@@ -1274,6 +1345,109 @@ mod m22_tests {
         }
         assert_eq!(tree.get(&victim), None);
         tree.check_invariants().unwrap();
+    }
+
+    /// Regression (M3.1 review): drain must reach resting messages that
+    /// sit BELOW an internal node whose own buffer is empty — a
+    /// delivery-driven descent alone never visits such a child.
+    #[test]
+    fn drain_reaches_messages_below_empty_buffers() {
+        let mut tree = BeTree::new(Params::default());
+        for b in 0..=255u8 {
+            tree.insert(vec![b], vec![b]);
+        }
+        assert!(tree.height() >= 3, "need an intermediate level");
+        // Empty every internal buffer, then plant one message at a
+        // leaf-parent: its ancestors all have EMPTY buffers.
+        for id in reachable(&tree) {
+            if let Node::Internal { buffer, .. } = &mut tree.nodes[id as usize] {
+                buffer.clear();
+            }
+        }
+        let path = route_path(&tree, &[0]);
+        let leaf_parent = path[path.len() - 2];
+        let key = vec![0u8];
+        tree.next_seq += 1;
+        let seq = tree.next_seq;
+        let Node::Internal { buffer, .. } = &mut tree.nodes[leaf_parent as usize] else {
+            unreachable!("the second-to-last path node is internal")
+        };
+        buffer.insert(
+            key.clone(),
+            Message::Put {
+                seq,
+                value: b"deep".to_vec(),
+            },
+        );
+        tree.check_invariants().unwrap();
+
+        tree.drain();
+
+        for id in reachable(&tree) {
+            if let Node::Internal { buffer, .. } = &tree.nodes[id as usize] {
+                assert!(
+                    buffer.is_empty(),
+                    "node {id} still buffers after drain — the planted message survived"
+                );
+            }
+        }
+        assert_eq!(tree.get(&key), Some(b"deep".to_vec()));
+        tree.check_invariants().unwrap();
+    }
+
+    /// drain() force-flushes every buffer to the leaves: afterwards the
+    /// tree is message-free, invariants hold, reads are unchanged, and —
+    /// because drain is OUTSIDE the performance model — the trace gained
+    /// NOTHING (no FlushDecision events; SPEC "Observability").
+    #[test]
+    fn drain_leaves_a_message_free_tree_and_no_trace() {
+        let mut tree = BeTree::new(Params::default());
+        let mut oracle: BTreeMap<Key, Value> = BTreeMap::new();
+        for i in 0..600u16 {
+            let key = vec![(i % 200) as u8];
+            tree.insert(key.clone(), le(i as i64));
+            oracle.insert(key, le(i as i64));
+        }
+        for b in (0..200u8).step_by(3) {
+            tree.delete(vec![b]);
+            oracle.remove(&vec![b]);
+        }
+        for b in (0..200u8).step_by(5) {
+            tree.upsert(vec![b], UpsertOp::Add(7));
+            let base = match oracle.get(&vec![b]) {
+                Some(v) if v.len() == 8 => i64::from_le_bytes(v.as_slice().try_into().unwrap()),
+                _ => 0,
+            };
+            oracle.insert(vec![b], le(base.wrapping_add(7)));
+        }
+        // Some buffers must be non-empty pre-drain or the test is vacuous.
+        let buffered_pre: usize = reachable(&tree)
+            .iter()
+            .map(|&id| match &tree.nodes[id as usize] {
+                Node::Internal { buffer, .. } => buffer.len(),
+                Node::Leaf { .. } => 0,
+            })
+            .sum();
+        assert!(buffered_pre > 0, "the workload must leave resting messages");
+        let trace_len_pre = tree.trace2().len();
+
+        tree.drain();
+
+        for id in reachable(&tree) {
+            if let Node::Internal { buffer, .. } = &tree.nodes[id as usize] {
+                assert!(buffer.is_empty(), "node {id} still buffers after drain");
+            }
+        }
+        tree.check_invariants().unwrap();
+        assert_eq!(
+            tree.trace2().len(),
+            trace_len_pre,
+            "drain must be invisible to traces"
+        );
+        let scanned = tree.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+        let expected: Vec<(Key, Value)> =
+            oracle.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(scanned, expected, "drain must not change the contents");
     }
 
     /// Scan across a leaf boundary and a reclamation-produced gap: empty

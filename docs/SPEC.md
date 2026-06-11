@@ -1,8 +1,8 @@
-# beetree specification — M0 + M1 + M2
+# beetree specification — M0 + M1 + M2 + M3.1
 
 This document is normative for milestones M0 (in-memory engine), M1
-(persistence and crash safety), and M2 (deletes, upserts, reclamation,
-range scans).
+(persistence and crash safety), M2 (deletes, upserts, reclamation, range
+scans), and M3.1 (the bounded cache and observability).
 The byte-frozen property-test harness in `tests/harness.rs` enforces the
 insert-only semantics mechanically; the full-mix harness in
 `tests/harness2.rs` (frozen when M2.2 ships) enforces the complete op
@@ -420,9 +420,48 @@ Range scans (M2.2), occupancy-based rebalancing/merges beyond Reclamation
 v1, additional `UpsertOp` variants, on-disk space reclamation, freezing
 `tests/harness2.rs` (that happens when M2.2 ships).
 
+## Observability (M3.1, normative)
+
+- **Engine-level I/O is the contract metric**: `CountingVfs` wraps any
+  `Vfs` transparently (byte-for-byte identical files, property-tested)
+  and `DiskEngine::io_stats()` snapshots read/write ops and bytes, syncs,
+  and set_lens — exactly the data-path operations the engine asked of the
+  device (`len()`, a pure metadata query, is uncounted).
+  `/proc/self/io` (linux-only, `proc_self_io()`) is the SECONDARY,
+  OS-level metric for M3.2 benchmarks: it includes everything else the
+  process does, and the page cache is not defeated in this build.
+- **Bounded node cache** (`DiskEngine` only; `BeTree` stays unbounded):
+  a byte budget configured at create/open (`*_bounded` constructors;
+  `None`/plain constructors = unbounded, all previous behavior
+  unchanged). Eviction is lazy LRU; clean nodes revert to their on-disk
+  records (reloads re-verify CRCs); dirty nodes are unevictable (writing
+  them back would publish uncommitted data, violating ADR-0007); every
+  operation's frame stack pins the nodes it holds. THE BUDGET IS A SOFT
+  TARGET UNDER PINNING PRESSURE: if pinned+dirty alone exceed it, the
+  cache goes over budget and counts an overcommit event rather than
+  failing (ADR-0015). `cache_stats()` reports hits, misses, evictions,
+  overcommit events, and resident bytes. Eviction is invisible to
+  durability, traces, and results — only the I/O and cache counters can
+  tell it happened.
+- `check_invariants` (trait, `&self`) still requires full residency;
+  bounded engines use `check_invariants_full(&mut self)`: suspend the
+  budget, fault everything in, check I1–I7, re-enforce.
+- **drain()** (`DiskEngine` and `BeTree`) force-flushes every buffer
+  until the tree is message-free: a benchmarking/analysis utility OUTSIDE
+  the performance model; its internal flushes are NOT traced (no
+  FlushDecision events) — never call it mid-workload when recording
+  traces for policy analysis. (It cannot be traced even in principle
+  without growing the frozen vocabulary; docs/findings.md.)
+
 ## Out of scope in M2.2
 
 Streaming scan cursors (ADR-0014), reverse scans, retiring the v1 trace
 view (deferred to a polish milestone together with a single documented
 harness re-baseline; docs/findings.md, "Deferred decisions"), cache
 eviction and memory budgets (M3).
+
+## Out of scope in M3.1
+
+Benchmarks themselves (M3.2), eviction policies beyond lazy LRU, byte
+budgets for `BeTree`, write-back caching (forbidden by ADR-0007 as long
+as there is no WAL), defeating the OS page cache.

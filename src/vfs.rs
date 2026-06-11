@@ -546,3 +546,134 @@ mod tests {
         assert_eq!(h.log_len(), 1);
     }
 }
+
+// ---------------------------------------------------------------------
+// CountingVfs: exact engine-level I/O accounting (M3.1).
+
+/// A snapshot of engine-level I/O counters (SPEC "Observability"): every
+/// DATA-PATH operation the engine issued through its [`Vfs`], counted
+/// exactly — reads, writes, syncs, set_lens. `len()` (a pure metadata
+/// query) is deliberately uncounted. This is the PRIMARY, contract-level
+/// metric; OS-level numbers ([`proc_self_io`]) are the secondary check
+/// (the page cache is not defeated in this build).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IoStats {
+    /// `read_exact_at` calls.
+    pub read_ops: u64,
+    /// Bytes requested across all reads.
+    pub read_bytes: u64,
+    /// `write_all_at` calls.
+    pub write_ops: u64,
+    /// Bytes written across all writes.
+    pub write_bytes: u64,
+    /// `sync` calls.
+    pub syncs: u64,
+    /// `set_len` calls.
+    pub set_lens: u64,
+}
+
+/// A transparent counting wrapper over any [`Vfs`]: byte-for-byte
+/// identical behavior (property-tested), plus an [`IoStats`] tally.
+/// `Cell` keeps counting possible from `read_exact_at(&self, ..)`.
+#[derive(Debug)]
+pub struct CountingVfs<V> {
+    inner: V,
+    stats: std::cell::Cell<IoStats>,
+}
+
+impl<V: Vfs> CountingVfs<V> {
+    /// Wrap a [`Vfs`], starting all counters at zero.
+    pub fn new(inner: V) -> CountingVfs<V> {
+        CountingVfs {
+            inner,
+            stats: std::cell::Cell::new(IoStats::default()),
+        }
+    }
+
+    /// The counters so far.
+    pub fn stats(&self) -> IoStats {
+        self.stats.get()
+    }
+}
+
+impl<V: Vfs> Vfs for CountingVfs<V> {
+    fn read_exact_at(&self, off: u64, buf: &mut [u8]) -> io::Result<()> {
+        let mut s = self.stats.get();
+        s.read_ops += 1;
+        s.read_bytes += buf.len() as u64;
+        self.stats.set(s);
+        self.inner.read_exact_at(off, buf)
+    }
+
+    fn write_all_at(&mut self, off: u64, data: &[u8]) -> io::Result<()> {
+        let mut s = self.stats.get();
+        s.write_ops += 1;
+        s.write_bytes += data.len() as u64;
+        self.stats.set(s);
+        self.inner.write_all_at(off, data)
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        let mut s = self.stats.get();
+        s.syncs += 1;
+        self.stats.set(s);
+        self.inner.sync()
+    }
+
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn set_len(&mut self, len: u64) -> io::Result<()> {
+        let mut s = self.stats.get();
+        s.set_lens += 1;
+        self.stats.set(s);
+        self.inner.set_len(len)
+    }
+}
+
+/// A snapshot of `/proc/self/io` (linux-only): the SECONDARY, OS-level
+/// I/O metric for M3.2 benchmarks. The engine-level [`IoStats`] is the
+/// contract metric; these numbers include everything else the process
+/// does and sit above a live page cache (SPEC "Observability").
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcIo {
+    /// Bytes read by syscalls (`rchar`).
+    pub rchar: u64,
+    /// Bytes written by syscalls (`wchar`).
+    pub wchar: u64,
+    /// Read syscalls (`syscr`).
+    pub syscr: u64,
+    /// Write syscalls (`syscw`).
+    pub syscw: u64,
+    /// Bytes actually fetched from the storage layer (`read_bytes`).
+    pub read_bytes: u64,
+    /// Bytes actually sent to the storage layer (`write_bytes`).
+    pub write_bytes: u64,
+}
+
+/// Read `/proc/self/io`. Observability tooling, not an engine code path:
+/// the engine itself still only touches storage through [`Vfs`].
+#[cfg(target_os = "linux")]
+pub fn proc_self_io() -> io::Result<ProcIo> {
+    let text = std::fs::read_to_string("/proc/self/io")?;
+    let mut out = ProcIo::default();
+    for line in text.lines() {
+        let mut parts = line.split(": ");
+        let (Some(field), Some(value)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let value: u64 = value.trim().parse().map_err(io::Error::other)?;
+        match field {
+            "rchar" => out.rchar = value,
+            "wchar" => out.wchar = value,
+            "syscr" => out.syscr = value,
+            "syscw" => out.syscw = value,
+            "read_bytes" => out.read_bytes = value,
+            "write_bytes" => out.write_bytes = value,
+            _ => {}
+        }
+    }
+    Ok(out)
+}

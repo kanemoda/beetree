@@ -18,7 +18,8 @@ honest benchmarks to back them.
 | M1.2 | Crash injection: `FaultyVfs` crash images at arbitrary points (ADR-0010), the A1–A5 recovery assertions, mutation-tested harness | done |
 | M2.1 | Full message algebra — deletes (tombstones annihilate at leaves) and upserts (data, not code; ADR-0011) — plus Reclamation v1 and on-disk format v2 | done |
 | M2.2 | Range scans (bottom-up application; collect semantics, ADR-0014), the blind-increment showcase, harness2 freeze | done |
-| M3 | Memory budgets: cache eviction, bounded scans | planned |
+| M3.1 | Measurement infrastructure: bounded node cache (lazy LRU, soft budget; ADR-0015), exact engine-level I/O accounting (`CountingVfs`), `drain()` | done |
+| M3.2 | Benchmarks | planned |
 
 ## Frozen harnesses
 

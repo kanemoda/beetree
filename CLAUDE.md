@@ -15,3 +15,8 @@
   capacities.
 - Public API or semantics changes require updating `docs/SPEC.md` in the same
   change.
+- tests/harness.rs and tests/harness2.rs are byte-frozen and contain
+  exhaustive matches. Until the documented re-baseline milestone,
+  frozen-matched enums (TraceEvent, OpKind, TraceEvent2, OpKind2) must NOT
+  gain variants. Features needing new trace vocabulary must wait or work
+  within the existing one.

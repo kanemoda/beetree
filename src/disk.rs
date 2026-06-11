@@ -14,7 +14,7 @@
 //!
 //! All I/O goes through [`Vfs`] (ADR-0009) so M1.2 can inject faults.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::mem;
@@ -113,13 +113,92 @@ enum NodeSlot {
     /// Resident node. `dirty` means it has changed since it was last
     /// written (or has never been written); `disk_offset` is its current
     /// record, if any. A clean loaded node ALWAYS has a disk offset.
+    /// `bytes` is the cache-accounted size (record length for clean
+    /// nodes, [`est_bytes`] for dirty ones, trailing the latest mutation
+    /// by one — ADR-0015); `last_tick` is the latest cache access.
     Loaded {
         node: Node,
         dirty: bool,
         disk_offset: Option<u64>,
+        bytes: u64,
+        last_tick: u64,
     },
-    /// Not yet loaded; the record lives at this offset.
+    /// Not yet loaded (or evicted); the record lives at this offset.
     OnDisk { offset: u64 },
+    /// Unlinked by reclamation (M3.1): the node is gone and its bytes
+    /// were released from cache accounting; the entry itself stays —
+    /// NodeIds are never reused (ADR-0004).
+    Freed,
+}
+
+/// A snapshot of the node cache's counters (SPEC "Observability").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    /// Node lookups answered from memory.
+    pub hits: u64,
+    /// Node lookups that read a record from storage.
+    pub misses: u64,
+    /// Clean nodes reverted to their on-disk record to make room.
+    pub evictions: u64,
+    /// Enforcement passes that could not reach the budget because
+    /// everything still resident was pinned or dirty (the budget is a
+    /// soft target under pinning pressure; SPEC "Observability").
+    pub overcommit_events: u64,
+    /// Current estimated resident bytes.
+    pub resident_bytes: u64,
+}
+
+/// The bounded node cache (ADR-0015): lazy-LRU over a tick-stamped
+/// `VecDeque`, byte-budgeted, dependency-free. `budget: None` (the
+/// default) disables eviction entirely — all pre-M3 behavior unchanged.
+#[derive(Debug, Default)]
+struct Cache {
+    budget: Option<u64>,
+    /// Σ `bytes` over resident slots.
+    bytes: u64,
+    resident: usize,
+    tick: u64,
+    /// (id, tick at push). An entry is current iff the slot is resident
+    /// and its `last_tick` equals the entry's tick; everything else is
+    /// stale and skipped (lazy LRU).
+    lru: VecDeque<(NodeId, u64)>,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+    overcommit_events: u64,
+}
+
+/// Estimated in-memory size of a node, mirroring the bincode fixed-int
+/// record encoding closely enough that a calibration property pins
+/// `0.5 ≤ est/serialized ≤ 2.0` (ADR-0015).
+fn est_bytes(node: &Node) -> u64 {
+    match node {
+        Node::Leaf { entries } => {
+            16 + entries
+                .iter()
+                .map(|(k, e)| 24 + k.len() as u64 + e.value.len() as u64)
+                .sum::<u64>()
+        }
+        Node::Internal {
+            pivots,
+            children,
+            buffer,
+        } => {
+            28 + pivots.iter().map(|p| 8 + p.len() as u64).sum::<u64>()
+                + 8 * children.len() as u64
+                + buffer
+                    .iter()
+                    .map(|(k, m)| {
+                        12 + k.len() as u64
+                            + match m {
+                                Message::Put { value, .. } => 20 + value.len() as u64,
+                                Message::Delete { .. } => 12,
+                                Message::Upsert { .. } => 24,
+                            }
+                    })
+                    .sum::<u64>()
+        }
+    }
 }
 
 /// A disk-backed Bε-tree (`docs/SPEC.md`; M1.1).
@@ -164,6 +243,12 @@ pub struct DiskEngine<V: Vfs> {
     /// Set when a storage error interrupts a mutation or a commit; from
     /// then on `commit()` refuses with [`DiskError::Poisoned`].
     poisoned: bool,
+    cache: Cache,
+    /// Record offset → canonical slot id: reloading an evicted parent
+    /// reuses its children's existing slots instead of allocating
+    /// duplicates (ADR-0015) — without this, the arena would grow per
+    /// miss and resident children would be double-counted.
+    offsets: BTreeMap<u64, NodeId>,
     trace: Recorder,
 }
 
@@ -204,12 +289,60 @@ impl DiskEngine<crate::vfs::FileVfs> {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, DiskError> {
         Self::open_on(crate::vfs::FileVfs::open(path).map_err(DiskError::Io)?)
     }
+
+    /// [`create`](DiskEngine::create) with a node-cache budget in bytes.
+    pub fn create_bounded(
+        path: impl AsRef<std::path::Path>,
+        params: Params,
+        cache_budget: u64,
+    ) -> Result<Self, DiskError> {
+        Self::create_on_bounded(
+            crate::vfs::FileVfs::create(path).map_err(DiskError::Io)?,
+            params,
+            cache_budget,
+        )
+    }
+
+    /// [`open`](DiskEngine::open) with a node-cache budget in bytes.
+    pub fn open_bounded(
+        path: impl AsRef<std::path::Path>,
+        cache_budget: u64,
+    ) -> Result<Self, DiskError> {
+        Self::open_on_bounded(
+            crate::vfs::FileVfs::open(path).map_err(DiskError::Io)?,
+            cache_budget,
+        )
+    }
+}
+
+/// Exact engine-level I/O accounting (SPEC "Observability"): available
+/// whenever the engine runs over a [`CountingVfs`](crate::vfs::CountingVfs).
+impl<V: Vfs> DiskEngine<crate::vfs::CountingVfs<V>> {
+    /// The I/O counters so far — the contract-level metric.
+    pub fn io_stats(&self) -> crate::vfs::IoStats {
+        self.vfs.stats()
+    }
 }
 
 impl<V: Vfs> DiskEngine<V> {
     /// [`create`](DiskEngine::create) over an arbitrary [`Vfs`] (the M1.2
-    /// fault-injection entry point).
+    /// fault-injection entry point). The node cache is unbounded.
     pub fn create_on(vfs: V, params: Params) -> Result<Self, DiskError> {
+        Self::create_on_with(vfs, params, None)
+    }
+
+    /// [`create_on`](DiskEngine::create_on) with a node-cache budget in
+    /// bytes (SPEC "Observability"; ADR-0015). The budget is a soft
+    /// target: pinned and dirty nodes are never evicted.
+    pub fn create_on_bounded(vfs: V, params: Params, cache_budget: u64) -> Result<Self, DiskError> {
+        Self::create_on_with(vfs, params, Some(cache_budget))
+    }
+
+    fn create_on_with(
+        vfs: V,
+        params: Params,
+        cache_budget: Option<u64>,
+    ) -> Result<Self, DiskError> {
         assert!(
             params.fanout >= 2 && params.buffer_capacity >= 1 && params.leaf_capacity >= 1,
             "illegal Params (need F >= 2, B >= 1, L >= 1): {params:?}"
@@ -218,29 +351,52 @@ impl<V: Vfs> DiskEngine<V> {
         if len > 0 {
             return Err(DiskError::NotEmpty { len });
         }
+        let root_leaf = Node::Leaf {
+            entries: BTreeMap::new(),
+        };
+        let bytes = est_bytes(&root_leaf);
         let mut engine = DiskEngine {
             params,
             vfs,
             slots: vec![NodeSlot::Loaded {
-                node: Node::Leaf {
-                    entries: BTreeMap::new(),
-                },
+                node: root_leaf,
                 dirty: true,
                 disk_offset: None,
+                bytes,
+                last_tick: 0,
             }],
             root: 0,
             next_seq: 0,
             next_generation: 0,
             watermark: DATA_START,
             poisoned: false,
+            cache: Cache {
+                budget: cache_budget,
+                bytes,
+                resident: 1,
+                ..Cache::default()
+            },
+            offsets: BTreeMap::new(),
             trace: Recorder::default(),
         };
+        engine.touch(0);
         engine.commit()?;
         Ok(engine)
     }
 
-    /// [`open`](DiskEngine::open) over an arbitrary [`Vfs`].
-    pub fn open_on(mut vfs: V) -> Result<Self, DiskError> {
+    /// [`open`](DiskEngine::open) over an arbitrary [`Vfs`]. The node
+    /// cache is unbounded.
+    pub fn open_on(vfs: V) -> Result<Self, DiskError> {
+        Self::open_on_with(vfs, None)
+    }
+
+    /// [`open_on`](DiskEngine::open_on) with a node-cache budget in bytes
+    /// (SPEC "Observability"; ADR-0015).
+    pub fn open_on_bounded(vfs: V, cache_budget: u64) -> Result<Self, DiskError> {
+        Self::open_on_with(vfs, Some(cache_budget))
+    }
+
+    fn open_on_with(mut vfs: V, cache_budget: Option<u64>) -> Result<Self, DiskError> {
         let file_len = vfs.len()?;
         let mut best: Option<Superblock> = None;
         let mut wrong_version: Option<u32> = None;
@@ -293,6 +449,11 @@ impl<V: Vfs> DiskEngine<V> {
             next_generation: sb.generation + 1,
             watermark: sb.watermark,
             poisoned: false,
+            cache: Cache {
+                budget: cache_budget,
+                ..Cache::default()
+            },
+            offsets: BTreeMap::from([(sb.root_offset, 0 as NodeId)]),
             trace: Recorder::default(),
         })
     }
@@ -362,6 +523,7 @@ impl<V: Vfs> DiskEngine<V> {
         let base = self.watermark;
         let mut buf: Vec<u8> = Vec::new();
         let mut assigned: BTreeMap<NodeId, u64> = BTreeMap::new();
+        let mut record_lens: BTreeMap<NodeId, u64> = BTreeMap::new();
         for &id in pre.iter().rev() {
             let offset = base + buf.len() as u64;
             let payload = self.node_payload(id, &assigned)?;
@@ -378,6 +540,7 @@ impl<V: Vfs> DiskEngine<V> {
             buf.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
             buf.extend_from_slice(&payload);
             assigned.insert(id, offset);
+            record_lens.insert(id, RECORD_HEADER_SIZE + payload.len() as u64);
         }
         if !buf.is_empty() {
             self.vfs.write_all_at(base, &buf)?;
@@ -408,14 +571,34 @@ impl<V: Vfs> DiskEngine<V> {
         for (id, off) in assigned {
             match &mut self.slots[id as usize] {
                 NodeSlot::Loaded {
-                    dirty, disk_offset, ..
+                    dirty,
+                    disk_offset,
+                    bytes,
+                    ..
                 } => {
                     *dirty = false;
-                    *disk_offset = Some(off);
+                    let old_offset = disk_offset.replace(off);
+                    // Clean nodes carry their exact record length as the
+                    // cache size (ADR-0015).
+                    let exact = record_lens[&id];
+                    self.cache.bytes = self.cache.bytes - *bytes + exact;
+                    *bytes = exact;
+                    // Keep the offset interning current: the old record
+                    // is dead, the new one is canonical for this id.
+                    if let Some(old) = old_offset {
+                        self.offsets.remove(&old);
+                    }
+                    self.offsets.insert(off, id);
                 }
-                NodeSlot::OnDisk { .. } => unreachable!("only resident nodes are written"),
+                NodeSlot::OnDisk { .. } | NodeSlot::Freed => {
+                    unreachable!("only resident nodes are written")
+                }
             }
         }
+        // Cleaning made these nodes evictable (and re-sized them to their
+        // exact record lengths): the commit boundary is the natural point
+        // to settle back under the budget.
+        self.enforce_budget(&[], None);
         Ok(CommitStats {
             nodes_written,
             bytes_written: buf.len() as u64 + SUPERBLOCK_SLOT_SIZE,
@@ -429,7 +612,7 @@ impl<V: Vfs> DiskEngine<V> {
     /// torn in-memory state would lose them; reopen to recover. An error
     /// loading the root happens before anything mutates and is clean.
     pub fn try_insert(&mut self, key: Key, value: Value) -> Result<(), DiskError> {
-        self.ensure_loaded(self.root)?;
+        self.ensure_loaded(self.root, &[])?;
         self.next_seq += 1;
         let seq = self.next_seq;
         self.trace.op(
@@ -445,7 +628,7 @@ impl<V: Vfs> DiskEngine<V> {
     /// Remove a key, reporting storage failures instead of panicking; the
     /// same error/poisoning semantics as [`DiskEngine::try_insert`].
     pub fn try_delete(&mut self, key: Key) -> Result<(), DiskError> {
-        self.ensure_loaded(self.root)?;
+        self.ensure_loaded(self.root, &[])?;
         self.next_seq += 1;
         let seq = self.next_seq;
         self.trace.op(seq, OpKind2::Delete { key: key.clone() });
@@ -456,7 +639,7 @@ impl<V: Vfs> DiskEngine<V> {
     /// panicking; the same error/poisoning semantics as
     /// [`DiskEngine::try_insert`].
     pub fn try_upsert(&mut self, key: Key, op: UpsertOp) -> Result<(), DiskError> {
-        self.ensure_loaded(self.root)?;
+        self.ensure_loaded(self.root, &[])?;
         self.next_seq += 1;
         let seq = self.next_seq;
         self.trace.op(
@@ -496,7 +679,7 @@ impl<V: Vfs> DiskEngine<V> {
         let mut chain: Option<i64> = None;
         let mut id = self.root;
         loop {
-            self.ensure_loaded(id)?;
+            self.ensure_loaded(id, &[])?;
             match self.loaded(id) {
                 Node::Internal {
                     pivots,
@@ -541,7 +724,7 @@ impl<V: Vfs> DiskEngine<V> {
         if range_is_empty(&lo, &hi) {
             return Ok(Vec::new());
         }
-        self.ensure_loaded(self.root)?;
+        self.ensure_loaded(self.root, &[])?;
         // Root leaf: the entries are the terminal resolutions.
         if let Node::Leaf { entries } = self.loaded(self.root) {
             return Ok(entries
@@ -568,6 +751,9 @@ impl<V: Vfs> DiskEngine<V> {
             next_child: 0,
             acc: BTreeMap::new(),
         }];
+        // The frame stack pins its nodes: parents are re-borrowed after
+        // child loads, so eviction must skip them (ADR-0015).
+        let mut pins: Vec<NodeId> = vec![self.root];
         loop {
             let frame = stack.len() - 1;
             let i = stack[frame].next_child;
@@ -593,7 +779,7 @@ impl<V: Vfs> DiskEngine<V> {
                     continue;
                 }
                 let child = children[i];
-                self.ensure_loaded(child)?;
+                self.ensure_loaded(child, &pins)?;
                 match self.loaded(child) {
                     Node::Leaf { entries } => {
                         for (k, e) in
@@ -610,6 +796,7 @@ impl<V: Vfs> DiskEngine<V> {
                             next_child: 0,
                             acc: BTreeMap::new(),
                         });
+                        pins.push(child);
                     }
                 }
             } else {
@@ -638,6 +825,7 @@ impl<V: Vfs> DiskEngine<V> {
                     }
                 }
                 stack.pop();
+                pins.pop();
                 match stack.last_mut() {
                     Some(parent) => parent.acc.append(&mut acc),
                     None => return Ok(acc.into_iter().collect()),
@@ -646,14 +834,16 @@ impl<V: Vfs> DiskEngine<V> {
         }
     }
 
-    /// Fault the entire committed tree into memory. Nothing evicts in M1,
-    /// so afterwards the tree stays fully resident — the precondition for
+    /// Fault the entire tree into memory. With an UNBOUNDED cache the
+    /// tree stays fully resident afterwards — the precondition for
     /// [`KvEngine::check_invariants`], which cannot read disk through
-    /// `&self`.
+    /// `&self`. Under a cache budget this is only a warming pass (nodes
+    /// may be evicted as later ones load); bounded engines check
+    /// invariants via [`DiskEngine::check_invariants_full`].
     pub fn load_all(&mut self) -> Result<(), DiskError> {
         let mut stack = vec![self.root];
         while let Some(id) = stack.pop() {
-            self.ensure_loaded(id)?;
+            self.ensure_loaded(id, &[])?;
             if let Node::Internal { children, .. } = self.loaded(id) {
                 stack.extend(children.iter().copied());
             }
@@ -661,23 +851,190 @@ impl<V: Vfs> DiskEngine<V> {
         Ok(())
     }
 
+    /// Run the full I1–I7 checker regardless of the cache budget: suspend
+    /// the budget, fault the whole tree in, check, then restore the
+    /// budget and evict back down. The bounded-cache counterpart of the
+    /// trait's `check_invariants` (which requires prior full residency).
+    /// Storage failure panics, mirroring the infallible trait surface.
+    pub fn check_invariants_full(&mut self) -> Result<(), InvariantViolation> {
+        let budget = self.cache.budget.take();
+        self.load_all()
+            .expect("storage failure while loading for check_invariants_full");
+        let result = check::check_invariants(self);
+        self.cache.budget = budget;
+        // Loads during the suspension bypassed LRU bookkeeping (touch
+        // no-ops while unbounded): re-stamp everything resident so the
+        // closing enforcement can actually evict back down.
+        if self.cache.budget.is_some() {
+            for id in 0..self.slots.len() as NodeId {
+                if matches!(self.slots[id as usize], NodeSlot::Loaded { .. }) {
+                    self.touch(id);
+                }
+            }
+        }
+        self.enforce_budget(&[], None);
+        result
+    }
+
     // ------------------------------------------------------------------
     // Slot bookkeeping.
 
     fn alloc_dirty(&mut self, node: Node) -> NodeId {
         let id = self.slots.len() as NodeId;
+        let bytes = est_bytes(&node);
         self.slots.push(NodeSlot::Loaded {
             node,
             dirty: true,
             disk_offset: None,
+            bytes,
+            last_tick: 0,
         });
+        self.cache.bytes += bytes;
+        self.cache.resident += 1;
+        self.touch(id);
+        // No enforcement here: the new node is dirty (unevictable) and the
+        // next load enforces anyway — the budget is a soft target.
         id
     }
 
     fn alloc_on_disk(&mut self, offset: u64) -> NodeId {
+        // Offsets identify immutable records (CoW), so a slot already
+        // tracking this offset IS this node — reuse it: a reloaded parent
+        // reconnects to its still-resident children instead of spawning
+        // duplicates (ADR-0015).
+        if let Some(&id) = self.offsets.get(&offset) {
+            if !matches!(self.slots[id as usize], NodeSlot::Freed) {
+                return id;
+            }
+        }
         let id = self.slots.len() as NodeId;
         self.slots.push(NodeSlot::OnDisk { offset });
+        self.offsets.insert(offset, id);
         id
+    }
+
+    /// Reclamation unlinked `id`: drop the node, release its bytes from
+    /// cache accounting, and retire its offset mapping. The arena entry
+    /// stays `Freed` — NodeIds are never reused (ADR-0004).
+    fn release_slot(&mut self, id: NodeId) {
+        match &self.slots[id as usize] {
+            NodeSlot::Loaded {
+                bytes, disk_offset, ..
+            } => {
+                self.cache.bytes -= *bytes;
+                self.cache.resident -= 1;
+                if let Some(offset) = disk_offset {
+                    self.offsets.remove(offset);
+                }
+            }
+            NodeSlot::OnDisk { offset } => {
+                self.offsets.remove(offset);
+            }
+            NodeSlot::Freed => return,
+        }
+        self.slots[id as usize] = NodeSlot::Freed;
+    }
+
+    // ------------------------------------------------------------------
+    // The bounded node cache (ADR-0015; SPEC "Observability").
+
+    /// Stamp `id` as just-accessed (lazy LRU: push a fresh tick; older
+    /// entries for the same id become stale and get skipped/compacted).
+    /// No bookkeeping when the cache is unbounded.
+    fn touch(&mut self, id: NodeId) {
+        if self.cache.budget.is_none() {
+            return;
+        }
+        self.cache.tick += 1;
+        let tick = self.cache.tick;
+        if let NodeSlot::Loaded { last_tick, .. } = &mut self.slots[id as usize] {
+            *last_tick = tick;
+        }
+        self.cache.lru.push_back((id, tick));
+        // Bound the deque: stale entries (superseded ticks, evicted ids)
+        // accumulate one per touch and compact away in O(len).
+        if self.cache.lru.len() > 64.max(self.cache.resident * 4) {
+            let mut lru = mem::take(&mut self.cache.lru);
+            lru.retain(|&(id, tick)| {
+                matches!(
+                    &self.slots[id as usize],
+                    NodeSlot::Loaded { last_tick, .. } if *last_tick == tick
+                )
+            });
+            self.cache.lru = lru;
+        }
+    }
+
+    /// Evict clean, unpinned nodes (oldest first) until the budget is
+    /// met. Never panics, never loops forever, never evicts a pinned or
+    /// dirty node; if pinned+dirty alone exceed the budget, the cache
+    /// goes over budget and counts an overcommit event instead (the
+    /// budget is a soft target under pinning pressure).
+    fn enforce_budget(&mut self, pins: &[NodeId], just_loaded: Option<NodeId>) {
+        let Some(budget) = self.cache.budget else {
+            return;
+        };
+        let mut examined = 0;
+        let max_examined = self.cache.lru.len();
+        while self.cache.bytes > budget && examined < max_examined {
+            let Some((id, tick)) = self.cache.lru.pop_front() else {
+                break;
+            };
+            examined += 1;
+            let (dirty, current) = match &self.slots[id as usize] {
+                NodeSlot::Loaded {
+                    dirty, last_tick, ..
+                } => (*dirty, *last_tick == tick),
+                // Stale: already evicted or unlinked.
+                NodeSlot::OnDisk { .. } | NodeSlot::Freed => continue,
+            };
+            if !current {
+                continue; // stale: a fresher entry exists further back
+            }
+            if dirty || pins.contains(&id) || just_loaded == Some(id) {
+                // Unevictable right now: keep it resident and treat it as
+                // recently used so the scan makes progress.
+                self.cache.tick += 1;
+                let tick = self.cache.tick;
+                if let NodeSlot::Loaded { last_tick, .. } = &mut self.slots[id as usize] {
+                    *last_tick = tick;
+                }
+                self.cache.lru.push_back((id, tick));
+                continue;
+            }
+            // Evict: revert the slot to its on-disk record (the reload
+            // path re-verifies the CRC).
+            let NodeSlot::Loaded {
+                dirty: false,
+                disk_offset,
+                bytes,
+                ..
+            } = &self.slots[id as usize]
+            else {
+                unreachable!("checked clean above")
+            };
+            debug_assert!(!pins.contains(&id), "never evict a pinned node");
+            let offset = disk_offset.expect("a clean resident node always has a disk offset");
+            let bytes = *bytes;
+            self.slots[id as usize] = NodeSlot::OnDisk { offset };
+            self.cache.bytes -= bytes;
+            self.cache.resident -= 1;
+            self.cache.evictions += 1;
+        }
+        if self.cache.bytes > budget {
+            self.cache.overcommit_events += 1;
+        }
+    }
+
+    /// A snapshot of the cache counters (SPEC "Observability").
+    pub fn cache_stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.cache.hits,
+            misses: self.cache.misses,
+            evictions: self.cache.evictions,
+            overcommit_events: self.cache.overcommit_events,
+            resident_bytes: self.cache.bytes,
+        }
     }
 
     fn is_dirty(&self, id: NodeId) -> bool {
@@ -696,21 +1053,34 @@ impl<V: Vfs> DiskEngine<V> {
             NodeSlot::OnDisk { offset } => {
                 unreachable!("engine bug: node {id} (record at {offset}) accessed before loading")
             }
+            NodeSlot::Freed => unreachable!("engine bug: freed node {id} accessed"),
         }
     }
 
     /// Mutable access to the resident node at `id`, marking it dirty:
     /// every mutation site goes through here, so nothing escapes the next
-    /// commit (insert path, flush cascade, splits alike).
+    /// commit (insert path, flush cascade, splits alike). The cache size
+    /// estimate is refreshed from the CURRENT state — i.e. it trails the
+    /// caller's upcoming mutation by exactly one touch, self-correcting on
+    /// the next access (ADR-0015; the budget is soft).
     fn loaded_mut(&mut self, id: NodeId) -> &mut Node {
-        match &mut self.slots[id as usize] {
-            NodeSlot::Loaded { node, dirty, .. } => {
-                *dirty = true;
-                node
-            }
+        let est = match &self.slots[id as usize] {
+            NodeSlot::Loaded { node, .. } => est_bytes(node),
             NodeSlot::OnDisk { offset } => {
                 unreachable!("engine bug: node {id} (record at {offset}) mutated before loading")
             }
+            NodeSlot::Freed => unreachable!("engine bug: freed node {id} mutated"),
+        };
+        match &mut self.slots[id as usize] {
+            NodeSlot::Loaded {
+                node, dirty, bytes, ..
+            } => {
+                *dirty = true;
+                self.cache.bytes = self.cache.bytes - *bytes + est;
+                *bytes = est;
+                node
+            }
+            NodeSlot::OnDisk { .. } | NodeSlot::Freed => unreachable!("checked above"),
         }
     }
 
@@ -718,12 +1088,21 @@ impl<V: Vfs> DiskEngine<V> {
     /// length and checksum (typed [`DiskError::CorruptNode`] on mismatch —
     /// never a panic, never wrong data), deserialize, and turn each child
     /// offset into a fresh `OnDisk` slot.
-    fn ensure_loaded(&mut self, id: NodeId) -> Result<(), DiskError> {
+    /// `pins` lists nodes the caller's frame stack still holds ids into
+    /// and will re-access without another `ensure_loaded`: eviction skips
+    /// them (ADR-0015). The node being loaded is implicitly pinned.
+    fn ensure_loaded(&mut self, id: NodeId, pins: &[NodeId]) -> Result<(), DiskError> {
         let offset = match &self.slots[id as usize] {
-            NodeSlot::Loaded { .. } => return Ok(()),
+            NodeSlot::Loaded { .. } => {
+                self.cache.hits += 1;
+                self.touch(id);
+                return Ok(());
+            }
             NodeSlot::OnDisk { offset } => *offset,
+            NodeSlot::Freed => unreachable!("engine bug: freed node {id} loaded"),
         };
-        let node = match self.read_record(offset)? {
+        let (disk_node, payload_len) = self.read_record(offset)?;
+        let node = match disk_node {
             DiskNode::Leaf { entries } => Node::Leaf { entries },
             DiskNode::Internal {
                 pivots,
@@ -768,16 +1147,24 @@ impl<V: Vfs> DiskEngine<V> {
                 }
             }
         };
+        let bytes = RECORD_HEADER_SIZE + payload_len;
         self.slots[id as usize] = NodeSlot::Loaded {
             node,
             dirty: false,
             disk_offset: Some(offset),
+            bytes,
+            last_tick: 0,
         };
+        self.cache.bytes += bytes;
+        self.cache.resident += 1;
+        self.cache.misses += 1;
+        self.touch(id);
+        self.enforce_budget(pins, Some(id));
         Ok(())
     }
 
     /// Read and validate the node record at `offset`.
-    fn read_record(&self, offset: u64) -> Result<DiskNode, DiskError> {
+    fn read_record(&self, offset: u64) -> Result<(DiskNode, u64), DiskError> {
         let corrupt = |reason: String| DiskError::CorruptNode { offset, reason };
         // Compare instead of adding to `offset`: a corrupt offset near
         // u64::MAX must fail the bounds check, not wrap around it.
@@ -808,7 +1195,8 @@ impl<V: Vfs> DiskEngine<V> {
                 "checksum mismatch (stored {stored_crc:#010x}, computed {computed:#010x})"
             )));
         }
-        decode_node(&payload).map_err(corrupt)
+        let len = payload.len() as u64;
+        Ok((decode_node(&payload).map_err(corrupt)?, len))
     }
 
     /// Serialize the resident node at `id` with child ids resolved to
@@ -843,6 +1231,7 @@ impl<V: Vfs> DiskEngine<V> {
     /// earlier in the children-first serialization order.
     fn resolve_offset(&self, id: NodeId, assigned: &BTreeMap<NodeId, u64>) -> u64 {
         match &self.slots[id as usize] {
+            NodeSlot::Freed => unreachable!("engine bug: freed node {id} resolved"),
             NodeSlot::OnDisk { offset } => *offset,
             NodeSlot::Loaded {
                 dirty: false,
@@ -866,10 +1255,40 @@ impl<V: Vfs> DiskEngine<V> {
     /// piece sits at the same depth as the old root, so a new root above
     /// them keeps all leaves at uniform depth (I6).
     fn restore_root(&mut self) -> Result<(), DiskError> {
+        self.restore_root_with(self.params.buffer_capacity, true)
+    }
+
+    /// Force-flush every buffer until the whole tree is message-free
+    /// (SPEC "Observability"): a benchmarking/analysis utility OUTSIDE
+    /// the performance model. Its internal flushes are NOT traced — no
+    /// FlushDecision events (docs/findings.md) — so never call it
+    /// mid-workload when recording traces for policy analysis. A flush
+    /// threshold of zero turns the ordinary cascade into a full drain:
+    /// every delivery that lands anything in a child buffer recurses
+    /// until the messages reach the leaves; the until-fixpoint pass
+    /// structure lives in `restore_root_with`'s loop.
+    pub fn drain(&mut self) -> Result<(), DiskError> {
+        // The root may be OnDisk (fresh open, or evicted at a commit
+        // boundary): fault it in like every other entry point.
+        self.ensure_loaded(self.root, &[])?;
+        let result = self.restore_root_with(0, false);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// The settling loop behind both public-op tails (`threshold` = B,
+    /// traced) and `drain` (`threshold` = 0, untraced).
+    fn restore_root_with(
+        &mut self,
+        threshold: usize,
+        trace_flushes: bool,
+    ) -> Result<(), DiskError> {
         loop {
             let root_is_internal = matches!(self.loaded(self.root), Node::Internal { .. });
             let outcome = if root_is_internal {
-                self.flush_overfull(self.root)?
+                self.flush_with(self.root, threshold, trace_flushes)?
             } else {
                 Outcome::Splits(self.split_if_needed(self.root))
             };
@@ -877,12 +1296,14 @@ impl<V: Vfs> DiskEngine<V> {
                 Outcome::Removed => {
                     // Every key range beneath the root emptied out: the
                     // tree is the empty tree again — its initial state, a
-                    // single (dirty) empty leaf. The old root's slot
-                    // leaks, and its records go unreferenced by the next
-                    // commit — CoW handles reclamation on disk.
+                    // single (dirty) empty leaf. The old root's records
+                    // go unreferenced by the next commit — CoW handles
+                    // disk; its slot is released from the cache (M3.1).
+                    let old_root = self.root;
                     self.root = self.alloc_dirty(Node::Leaf {
                         entries: BTreeMap::new(),
                     });
+                    self.release_slot(old_root);
                     break;
                 }
                 Outcome::Splits(promoted) => promoted,
@@ -918,8 +1339,10 @@ impl<V: Vfs> DiskEngine<V> {
                 Node::Internal {
                     children, buffer, ..
                 } if children.len() == 1 && buffer.is_empty() => {
+                    let old_root = self.root;
                     self.root = children[0];
-                    self.ensure_loaded(self.root)?;
+                    self.release_slot(old_root);
+                    self.ensure_loaded(self.root, &[])?;
                 }
                 _ => break,
             }
@@ -927,15 +1350,24 @@ impl<V: Vfs> DiskEngine<V> {
         Ok(())
     }
 
-    /// Flush this internal node's buffer until it holds ≤ B messages, then
-    /// settle the node itself: split it if its fanout overflowed, or
-    /// signal [`Outcome::Removed`] if deliveries emptied every child out
-    /// from under it (ADR-0005; SPEC "Reclamation v1"). Errors only on
-    /// storage failure while loading a flush target.
+    /// Flush this internal node's buffer until it holds ≤ `threshold`
+    /// messages, then settle the node itself: split it if its fanout
+    /// overflowed, or signal [`Outcome::Removed`] if deliveries emptied
+    /// every child out from under it (ADR-0005; SPEC "Reclamation v1").
+    /// `threshold` is B for ordinary cascades and 0 for `drain` (whose
+    /// flushes are also untraced). Errors only on storage failure while
+    /// loading a flush target.
     ///
     /// Explicit frame stack, NOT machine recursion, exactly as in
-    /// `src/betree.rs`: degenerate F=2 trees are linearly tall.
-    fn flush_overfull(&mut self, id: NodeId) -> Result<Outcome, DiskError> {
+    /// `src/betree.rs`: degenerate F=2 trees are linearly tall. The stack
+    /// also PINS its nodes against cache eviction (ADR-0015) — they are
+    /// re-accessed after child loads without another `ensure_loaded`.
+    fn flush_with(
+        &mut self,
+        id: NodeId,
+        threshold: usize,
+        trace_flushes: bool,
+    ) -> Result<Outcome, DiskError> {
         // Nodes currently flushing, cascade root first. A node below the
         // top of the stack is waiting for its overfull child above it.
         let mut flushing: Vec<NodeId> = vec![id];
@@ -943,7 +1375,32 @@ impl<V: Vfs> DiskEngine<V> {
             let top = *flushing
                 .last()
                 .expect("the flush stack only empties via the return below");
-            if self.buffer_len(top) <= self.params.buffer_capacity {
+            if self.buffer_len(top) <= threshold {
+                if threshold == 0 {
+                    // Drain mode: a delivery-driven cascade never visits a
+                    // child the parent holds no messages for, so descend
+                    // into any child whose SUBTREE still holds resting
+                    // messages (the child's own buffer may be empty above
+                    // a buffered descendant); the flushing stack wires its
+                    // outcome to `top` as usual.
+                    let children: Vec<NodeId> = match self.loaded(top) {
+                        Node::Internal { children, .. } => children.clone(),
+                        Node::Leaf { .. } => Vec::new(),
+                    };
+                    let mut descended = false;
+                    for child in children {
+                        let mut pins = flushing.clone();
+                        pins.push(child);
+                        if self.subtree_has_messages(child, &pins)? {
+                            flushing.push(child);
+                            descended = true;
+                            break;
+                        }
+                    }
+                    if descended {
+                        continue;
+                    }
+                }
                 // `top` is done: hand its outcome to the frame below (its
                 // parent in the cascade), or to the caller for the
                 // cascade root.
@@ -959,8 +1416,10 @@ impl<V: Vfs> DiskEngine<V> {
                 continue;
             }
             let (chosen, child_id, child_occupancies, batch) = self.pick_and_extract(top);
-            self.trace.flush_decision(top, child_occupancies, chosen);
-            match self.apply_batch(child_id, batch)? {
+            if trace_flushes {
+                self.trace.flush_decision(top, child_occupancies, chosen);
+            }
+            match self.apply_batch(child_id, batch, &flushing, threshold)? {
                 Delivery::Internal { overflowed: true } => {
                     // The child's buffer now overflows too: flush it to
                     // completion before continuing with `top`.
@@ -981,6 +1440,26 @@ impl<V: Vfs> DiskEngine<V> {
                 }
             }
         }
+    }
+
+    /// Drain-mode probe: does any buffer in `id`'s subtree hold messages?
+    /// Loads lazily; `pins` keeps the active flushing stack (and the
+    /// probed child) safe from eviction during those loads.
+    fn subtree_has_messages(&mut self, id: NodeId, pins: &[NodeId]) -> Result<bool, DiskError> {
+        let mut stack = vec![id];
+        while let Some(n) = stack.pop() {
+            self.ensure_loaded(n, pins)?;
+            if let Node::Internal {
+                buffer, children, ..
+            } = self.loaded(n)
+            {
+                if !buffer.is_empty() {
+                    return Ok(true);
+                }
+                stack.extend(children.iter().copied());
+            }
+        }
+        Ok(false)
     }
 
     /// A flushed node's parting word to its parent: [`Outcome::Removed`]
@@ -1009,7 +1488,8 @@ impl<V: Vfs> DiskEngine<V> {
     /// a single child PERSISTS (fanout-1 internals are legal; same
     /// degeneracy class as F=2); one reduced to zero children signals
     /// [`Outcome::Removed`] when it settles. The reclaimed child's slot
-    /// leaks, and its records go unreferenced by the next commit.
+    /// is released from cache accounting (M3.1); its records go
+    /// unreferenced by the next commit.
     fn remove_child(&mut self, parent: NodeId, child: NodeId) {
         let Node::Internal {
             pivots, children, ..
@@ -1027,6 +1507,10 @@ impl<V: Vfs> DiskEngine<V> {
         } else if !pivots.is_empty() {
             pivots.remove(0);
         }
+        // The unlinked child leaves cache accounting too (M3.1):
+        // otherwise emptied leaves linger as unevictable dirty garbage,
+        // monotonically eroding the budget.
+        self.release_slot(child);
     }
 
     fn buffer_len(&self, id: NodeId) -> usize {
@@ -1082,9 +1566,10 @@ impl<V: Vfs> DiskEngine<V> {
         &mut self,
         child_id: NodeId,
         batch: BTreeMap<Key, Message>,
+        pins: &[NodeId],
+        threshold: usize,
     ) -> Result<Delivery, DiskError> {
-        self.ensure_loaded(child_id)?;
-        let buffer_capacity = self.params.buffer_capacity;
+        self.ensure_loaded(child_id, pins)?;
         Ok(match self.loaded_mut(child_id) {
             Node::Leaf { entries } => {
                 for (key, message) in batch {
@@ -1099,7 +1584,7 @@ impl<V: Vfs> DiskEngine<V> {
                     coalesce_into(buffer, key, message);
                 }
                 Delivery::Internal {
-                    overflowed: buffer.len() > buffer_capacity,
+                    overflowed: buffer.len() > threshold,
                 }
             }
         })
@@ -1256,6 +1741,7 @@ impl<V: Vfs> NodeSource for DiskEngine<V> {
     fn node(&self, id: NodeId) -> &Node {
         match &self.slots[id as usize] {
             NodeSlot::Loaded { node, .. } => node,
+            NodeSlot::Freed => panic!("checker reached freed node {id}: engine bug"),
             NodeSlot::OnDisk { .. } => panic!(
                 "check_invariants requires a fully resident tree: \
                  call load_all() first (node {id} is still on disk)"
@@ -1445,6 +1931,185 @@ mod tests {
             assert!(
                 matches!(err, DiskError::CorruptNode { .. }),
                 "case {i}: got {err:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn key_strategy() -> impl Strategy<Value = Key> {
+        proptest::collection::vec(any::<u8>(), 0..=12)
+    }
+
+    fn message_strategy() -> impl Strategy<Value = Message> {
+        prop_oneof![
+            (any::<u64>(), proptest::collection::vec(any::<u8>(), 0..=16))
+                .prop_map(|(seq, value)| Message::Put { seq, value }),
+            any::<u64>().prop_map(|seq| Message::Delete { seq }),
+            (any::<u64>(), any::<i64>()).prop_map(|(seq, d)| Message::Upsert {
+                seq,
+                op: UpsertOp::Add(d),
+            }),
+        ]
+    }
+
+    fn node_strategy() -> impl Strategy<Value = Node> {
+        prop_oneof![
+            proptest::collection::btree_map(
+                key_strategy(),
+                (any::<u64>(), proptest::collection::vec(any::<u8>(), 0..=16))
+                    .prop_map(|(seq, value)| LeafEntry { seq, value }),
+                0..=12,
+            )
+            .prop_map(|entries| Node::Leaf { entries }),
+            (
+                proptest::collection::btree_set(key_strategy(), 0..=6),
+                proptest::collection::btree_map(key_strategy(), message_strategy(), 0..=12),
+            )
+                .prop_map(|(pivots, buffer)| {
+                    let pivots: Vec<Key> = pivots.into_iter().collect();
+                    let children = vec![0 as NodeId; pivots.len() + 1];
+                    Node::Internal {
+                        pivots,
+                        children,
+                        buffer,
+                    }
+                }),
+        ]
+    }
+
+    /// Regression (M3.1 review): reloading an evicted internal node must
+    /// re-intern its children's slots, not allocate duplicates — the
+    /// arena stays fixed across repeated evict/reload cycles.
+    #[test]
+    fn reloads_reuse_slots_instead_of_duplicating() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine =
+            DiskEngine::create_bounded(dir.path().join("intern.db"), Params::default(), 1024)
+                .unwrap();
+        for b in 0..=255u8 {
+            engine.insert(vec![b], vec![b; 16]);
+        }
+        engine.commit().unwrap();
+        for b in 0..=255u8 {
+            engine.try_get(&[b]).unwrap();
+        }
+        let slots_after_first_sweep = engine.slots.len();
+        let evictions_first = engine.cache_stats().evictions;
+        for _ in 0..3 {
+            for b in 0..=255u8 {
+                engine.try_get(&[b]).unwrap();
+            }
+        }
+        assert!(
+            engine.cache_stats().evictions > evictions_first,
+            "the sweeps must keep evicting"
+        );
+        assert_eq!(
+            engine.slots.len(),
+            slots_after_first_sweep,
+            "repeated evict/reload cycles must not grow the slot arena"
+        );
+    }
+
+    /// Regression (M3.1 review): drain must reach resting messages that
+    /// sit BELOW an internal node whose own buffer is empty.
+    #[test]
+    fn drain_reaches_messages_below_empty_buffers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = DiskEngine::create(dir.path().join("deep.db"), Params::default()).unwrap();
+        for b in 0..=255u8 {
+            engine.insert(vec![b], vec![b]);
+        }
+        // Empty every internal buffer (white-box), then plant one message
+        // at a leaf-parent whose ancestors all have empty buffers.
+        let mut ids = vec![engine.root];
+        let mut all = Vec::new();
+        while let Some(id) = ids.pop() {
+            all.push(id);
+            if let Node::Internal { children, .. } = engine.loaded(id) {
+                ids.extend(children.iter().copied());
+            }
+        }
+        for &id in &all {
+            if matches!(engine.loaded(id), Node::Internal { .. }) {
+                if let Node::Internal { buffer, .. } = engine.loaded_mut(id) {
+                    buffer.clear();
+                }
+            }
+        }
+        // Walk to the leaf-parent of key [0].
+        let mut id = engine.root;
+        let mut leaf_parent = id;
+        while let Node::Internal {
+            pivots, children, ..
+        } = engine.loaded(id)
+        {
+            leaf_parent = id;
+            id = children[route(pivots, &[0])];
+        }
+        engine.next_seq += 1;
+        let seq = engine.next_seq;
+        let Node::Internal { buffer, .. } = engine.loaded_mut(leaf_parent) else {
+            unreachable!("the leaf parent is internal")
+        };
+        buffer.insert(
+            vec![0u8],
+            Message::Put {
+                seq,
+                value: b"deep".to_vec(),
+            },
+        );
+        engine.check_invariants_full().unwrap();
+
+        engine.drain().unwrap();
+
+        for &id in &all {
+            if let NodeSlot::Loaded {
+                node: Node::Internal { buffer, .. },
+                ..
+            } = &engine.slots[id as usize]
+            {
+                assert!(
+                    buffer.is_empty(),
+                    "node {id} still buffers after drain — the planted message survived"
+                );
+            }
+        }
+        assert_eq!(engine.try_get(&[0]).unwrap(), Some(b"deep".to_vec()));
+        engine.check_invariants_full().unwrap();
+    }
+
+    proptest! {
+        /// Calibration (ADR-0015): the cache's size estimate stays within
+        /// a factor of two of the true serialized record size, both ways.
+        #[test]
+        fn est_bytes_tracks_serialized_size(node in node_strategy()) {
+            let disk_node = match &node {
+                Node::Leaf { entries } => DiskNode::Leaf {
+                    entries: entries.clone(),
+                },
+                Node::Internal {
+                    pivots,
+                    children,
+                    buffer,
+                } => DiskNode::Internal {
+                    pivots: pivots.clone(),
+                    children: vec![DATA_START; children.len()],
+                    buffer: buffer.clone(),
+                },
+            };
+            let serialized = encode_node(&disk_node).unwrap().len() as u64;
+            let est = est_bytes(&node);
+            let ratio = est as f64 / serialized as f64;
+            prop_assert!(
+                (0.5..=2.0).contains(&ratio),
+                "est {est} vs serialized {serialized}: ratio {ratio}"
             );
         }
     }

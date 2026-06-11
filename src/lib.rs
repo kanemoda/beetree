@@ -24,11 +24,13 @@ pub mod types;
 pub mod vfs;
 
 pub use betree::BeTree;
-pub use disk::{CommitStats, DiskEngine, DiskError};
+pub use disk::{CacheStats, CommitStats, DiskEngine, DiskError};
 pub use engine::{EngineError, KvEngine};
 pub use naive::NaiveEngine;
 pub use trace::{OpKind, OpKind2, TraceEvent, TraceEvent2, from_jsonl, replay, replay2, to_jsonl};
 pub use types::{CapacityKind, InvariantViolation, Key, Message, Params, UpsertOp, Value};
 #[cfg(unix)]
 pub use vfs::FileVfs;
-pub use vfs::{Fate, FaultyVfs, Vfs, VfsOp};
+pub use vfs::{CountingVfs, Fate, FaultyVfs, IoStats, Vfs, VfsOp};
+#[cfg(target_os = "linux")]
+pub use vfs::{ProcIo, proc_self_io};
