@@ -2,14 +2,21 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::types::{Key, Message, Value};
 
-/// Index of a node in the arena (`BeTree::nodes`, ADR-0004).
+/// Index of a node in the arena (`BeTree::nodes`, ADR-0004; `DiskEngine`
+/// slots, M1.1).
 pub(crate) type NodeId = u64;
 
 /// A materialized key/value pair in a leaf, tagged with the seqno of the
 /// message that produced it (needed for the I3 freshness check).
-#[derive(Debug)]
+///
+/// Serde derives serve the on-disk node records (`docs/SPEC.md`, "On-disk
+/// format v1"); `Clone` lets a commit serialize a leaf without taking it
+/// apart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LeafEntry {
     pub seq: u64,
     pub value: Value,
@@ -37,6 +44,23 @@ pub(crate) enum Node {
 /// child on the pivot's RIGHT.
 pub(crate) fn route(pivots: &[Key], key: &[u8]) -> usize {
     pivots.partition_point(|p| p.as_slice() <= key)
+}
+
+/// Sizes of the pieces an overfull collection of `n` items splits into,
+/// each piece ≤ `cap`, by repeated halving (so pieces stay balanced and the
+/// two-piece case is the classic median split). `n` can far exceed
+/// `2 * cap`: batches accumulate down a flush spine (each level adds up to
+/// B at-rest messages), so one delivery can carry on the order of
+/// height × B messages on top of the receiver's existing contents.
+pub(crate) fn partition_sizes(n: usize, cap: usize) -> Vec<usize> {
+    if n <= cap {
+        vec![n]
+    } else {
+        let left = n / 2;
+        let mut sizes = partition_sizes(left, cap);
+        sizes.extend(partition_sizes(n - left, cap));
+        sizes
+    }
 }
 
 #[cfg(test)]
@@ -76,5 +100,15 @@ mod tests {
     #[test]
     fn no_pivots_means_a_single_child_owns_everything() {
         assert_eq!(route(&[], &[42]), 0);
+    }
+
+    #[test]
+    fn partition_sizes_balances_pieces() {
+        assert_eq!(partition_sizes(5, 8), vec![5]);
+        assert_eq!(partition_sizes(9, 8), vec![4, 5]);
+        assert_eq!(partition_sizes(5, 4), vec![2, 3]);
+        assert_eq!(partition_sizes(9, 1), vec![1; 9]);
+        assert!(partition_sizes(17, 4).iter().all(|&s| (1..=4).contains(&s)));
+        assert_eq!(partition_sizes(17, 4).iter().sum::<usize>(), 17);
     }
 }

@@ -14,8 +14,9 @@ honest benchmarks to back them.
 |-----------|-------|--------|
 | M0.1 | Project skeleton, SPEC, generic property-test harness, naive reference engine | done |
 | M0.2 | In-memory Bε-tree that passes the M0.1 harness unchanged | done |
-| M1 | Deletes/tombstones, upserts, range scans, copy-on-write nodes (replaces the append-only arena; ADR-0004) | planned |
-| M2 | Node merges | planned |
+| M1.1 | Persistence: copy-on-write nodes in a single file, dual-superblock atomic commit, recovery — no WAL by design (ADR-0007..0009) | done |
+| M1.2 | Crash injection: a fault-injecting in-memory `Vfs` hammering the durability contract | planned |
+| M2 | Deletes/tombstones and the node merges they trigger (ADR-0002); upserts, range scans | planned |
 
 ## Build & test
 

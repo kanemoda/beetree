@@ -63,7 +63,9 @@ pub enum TraceEvent {
 ///
 /// The serialized form records events only — it does not record [`Params`],
 /// so a trace file is not self-describing. Keep the originating parameters
-/// alongside a saved trace and pass them to [`replay`].
+/// alongside a saved trace and pass them to [`replay`]. (Database files are
+/// different since M1.1: they persist their params in the superblock —
+/// `docs/SPEC.md`, "On-disk format v1" — but traces remain out-of-band.)
 pub fn to_jsonl(events: &[TraceEvent]) -> serde_json::Result<String> {
     let mut out = String::new();
     for event in events {

@@ -8,12 +8,12 @@
 
 use std::collections::BTreeMap;
 use std::mem;
-use std::ops::Bound;
 
+use crate::check::{self, NodeSource};
 use crate::engine::KvEngine;
-use crate::node::{LeafEntry, Node, NodeId, route};
+use crate::node::{LeafEntry, Node, NodeId, partition_sizes, route};
 use crate::trace::{OpKind, TraceEvent};
-use crate::types::{CapacityKind, InvariantViolation, Key, Message, Params, Value};
+use crate::types::{InvariantViolation, Key, Message, Params, Value};
 
 /// A Bε-tree key-value engine (`docs/SPEC.md`).
 ///
@@ -39,32 +39,20 @@ pub struct BeTree {
     trace: Vec<TraceEvent>,
 }
 
-/// Min/max leaf depth seen during an invariant walk (I6).
-struct LeafDepths {
-    shallowest: usize,
-    deepest: usize,
-}
-
-/// Sizes of the pieces an overfull collection of `n` items splits into,
-/// each piece ≤ `cap`, by repeated halving (so pieces stay balanced and the
-/// two-piece case is the classic median split). `n` can far exceed
-/// `2 * cap`: batches accumulate down a flush spine (each level adds up to
-/// B at-rest messages), so one delivery can carry on the order of
-/// height × B messages on top of the receiver's existing contents.
-fn partition_sizes(n: usize, cap: usize) -> Vec<usize> {
-    if n <= cap {
-        vec![n]
-    } else {
-        let left = n / 2;
-        let mut sizes = partition_sizes(left, cap);
-        sizes.extend(partition_sizes(n - left, cap));
-        sizes
+/// The invariant checker resolves nodes straight out of the arena
+/// (`src/check.rs` holds the shared walk).
+impl NodeSource for BeTree {
+    fn root(&self) -> NodeId {
+        self.root
     }
-}
 
-/// Is `key` inside `[lower, upper)`? `None` bounds are -inf / +inf.
-fn in_range(key: &[u8], lower: Option<&[u8]>, upper: Option<&[u8]>) -> bool {
-    lower.is_none_or(|lo| key >= lo) && upper.is_none_or(|hi| key < hi)
+    fn params(&self) -> &Params {
+        &self.params
+    }
+
+    fn node(&self, id: NodeId) -> &Node {
+        &self.nodes[id as usize]
+    }
 }
 
 impl BeTree {
@@ -384,205 +372,6 @@ impl BeTree {
         }
         promoted
     }
-
-    /// Worker for `check_invariants`: verify I1–I5 at every node, refining
-    /// key bounds downward and carrying the I3 "newest seq seen above" map
-    /// (restored via undo frames once a subtree completes).
-    ///
-    /// The walk uses an explicit frame stack, NOT machine recursion: a
-    /// VALID tree can be linearly tall under legal-but-degenerate
-    /// parameters (F=2 with sorted insertion; `docs/SPEC.md`, "Structure
-    /// parameters"), and the checker must report — never crash — on
-    /// anything the engine can legally build.
-    fn check_tree(&self, depths: &mut LeafDepths) -> Result<(), InvariantViolation> {
-        /// One unit of pending walk work.
-        enum Frame<'a> {
-            /// Visit a node: apply `overlay` (the parent's buffered
-            /// messages for this node's key range) to the I3 map, check
-            /// the node, queue its children.
-            Enter {
-                id: NodeId,
-                lower: Option<&'a [u8]>,
-                upper: Option<&'a [u8]>,
-                depth: usize,
-                overlay: Vec<(Key, u64)>,
-            },
-            /// Restore the I3 map after a subtree is fully checked.
-            Undo { entries: Vec<(Key, Option<u64>)> },
-        }
-
-        let mut newest_above: BTreeMap<Key, u64> = BTreeMap::new();
-        let mut stack = vec![Frame::Enter {
-            id: self.root,
-            lower: None,
-            upper: None,
-            depth: 1,
-            overlay: Vec::new(),
-        }];
-
-        while let Some(frame) = stack.pop() {
-            let (id, lower, upper, depth, overlay) = match frame {
-                Frame::Undo { entries } => {
-                    for (key, previous) in entries.into_iter().rev() {
-                        match previous {
-                            Some(seq) => newest_above.insert(key, seq),
-                            None => newest_above.remove(&key),
-                        };
-                    }
-                    continue;
-                }
-                Frame::Enter {
-                    id,
-                    lower,
-                    upper,
-                    depth,
-                    overlay,
-                } => (id, lower, upper, depth, overlay),
-            };
-
-            // Overlay the parent's messages for this subtree onto the I3
-            // map. The matching Undo frame sits BELOW everything this node
-            // pushes, so it runs exactly when the subtree completes.
-            let mut undo = Vec::with_capacity(overlay.len());
-            for (key, seq) in overlay {
-                let previous = newest_above.insert(key.clone(), seq);
-                undo.push((key, previous));
-            }
-            stack.push(Frame::Undo { entries: undo });
-
-            match &self.nodes[id as usize] {
-                Node::Leaf { entries } => {
-                    if entries.len() > self.params.leaf_capacity {
-                        return Err(InvariantViolation::OverCapacity {
-                            node: id,
-                            kind: CapacityKind::Leaf,
-                            occupancy: entries.len(),
-                            limit: self.params.leaf_capacity,
-                        });
-                    }
-                    for (key, entry) in entries {
-                        if !in_range(key, lower, upper) {
-                            return Err(InvariantViolation::KeyOutsideOwnedRange {
-                                node: id,
-                                key: key.clone(),
-                            });
-                        }
-                        if let Some(&above) = newest_above.get(key) {
-                            if entry.seq >= above {
-                                return Err(InvariantViolation::StaleAncestor {
-                                    key: key.clone(),
-                                    ancestor_seq: above,
-                                    descendant_seq: entry.seq,
-                                });
-                            }
-                        }
-                    }
-                    depths.shallowest = depths.shallowest.min(depth);
-                    depths.deepest = depths.deepest.max(depth);
-                }
-                Node::Internal {
-                    pivots,
-                    children,
-                    buffer,
-                } => {
-                    // I2: pivots strictly increasing.
-                    for i in 1..pivots.len() {
-                        if pivots[i - 1] >= pivots[i] {
-                            return Err(InvariantViolation::PivotsOutOfOrder {
-                                node: id,
-                                index: i,
-                            });
-                        }
-                    }
-                    // I2: k pivots ⇒ exactly k+1 children.
-                    if children.len() != pivots.len() + 1 {
-                        return Err(InvariantViolation::PivotChildMismatch {
-                            node: id,
-                            pivots: pivots.len(),
-                            children: children.len(),
-                        });
-                    }
-                    // I5: fanout and buffer capacity at rest.
-                    if children.len() > self.params.fanout {
-                        return Err(InvariantViolation::OverCapacity {
-                            node: id,
-                            kind: CapacityKind::Fanout,
-                            occupancy: children.len(),
-                            limit: self.params.fanout,
-                        });
-                    }
-                    if buffer.len() > self.params.buffer_capacity {
-                        return Err(InvariantViolation::OverCapacity {
-                            node: id,
-                            kind: CapacityKind::Buffer,
-                            occupancy: buffer.len(),
-                            limit: self.params.buffer_capacity,
-                        });
-                    }
-                    // Pivots must lie in the node's own range; this also
-                    // keeps the child range bounds below well-formed even
-                    // on a corrupt tree (the checker must report, never
-                    // panic).
-                    for pivot in pivots {
-                        if !in_range(pivot, lower, upper) {
-                            return Err(InvariantViolation::KeyOutsideOwnedRange {
-                                node: id,
-                                key: pivot.clone(),
-                            });
-                        }
-                    }
-                    // I4 is structural here: the buffer is a BTreeMap keyed
-                    // by Key, so it cannot hold two messages for one key.
-                    // I1 + I3 for the buffered messages themselves.
-                    for (key, message) in buffer {
-                        if !in_range(key, lower, upper) {
-                            return Err(InvariantViolation::KeyOutsideOwnedRange {
-                                node: id,
-                                key: key.clone(),
-                            });
-                        }
-                        if let Some(&above) = newest_above.get(key) {
-                            if message.seq() >= above {
-                                return Err(InvariantViolation::StaleAncestor {
-                                    key: key.clone(),
-                                    ancestor_seq: above,
-                                    descendant_seq: message.seq(),
-                                });
-                            }
-                        }
-                    }
-                    // Queue the children with refined bounds and their
-                    // slice of this buffer as the I3 overlay. Sibling order
-                    // is immaterial: each child's Undo frame restores the
-                    // map before the next sibling's Enter frame runs.
-                    for (i, &child) in children.iter().enumerate() {
-                        let child_lower = if i == 0 {
-                            lower
-                        } else {
-                            Some(pivots[i - 1].as_slice())
-                        };
-                        let child_upper = pivots.get(i).map(|p| p.as_slice()).or(upper);
-                        let range = (
-                            child_lower.map_or(Bound::Unbounded, Bound::Included),
-                            child_upper.map_or(Bound::Unbounded, Bound::Excluded),
-                        );
-                        let overlay = buffer
-                            .range::<[u8], _>(range)
-                            .map(|(key, message)| (key.clone(), message.seq()))
-                            .collect();
-                        stack.push(Frame::Enter {
-                            id: child,
-                            lower: child_lower,
-                            upper: child_upper,
-                            depth: depth + 1,
-                            overlay,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 impl KvEngine for BeTree {
@@ -656,19 +445,7 @@ impl KvEngine for BeTree {
     }
 
     fn check_invariants(&self) -> Result<(), InvariantViolation> {
-        let mut depths = LeafDepths {
-            shallowest: usize::MAX,
-            deepest: 0,
-        };
-        self.check_tree(&mut depths)?;
-        // I6: every leaf at the same depth.
-        if depths.shallowest != depths.deepest {
-            return Err(InvariantViolation::UnevenLeafDepth {
-                shallowest: depths.shallowest,
-                deepest: depths.deepest,
-            });
-        }
-        Ok(())
+        check::check_invariants(self)
     }
 
     fn trace(&self) -> &[TraceEvent] {
@@ -679,16 +456,6 @@ impl KvEngine for BeTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn partition_sizes_balances_pieces() {
-        assert_eq!(partition_sizes(5, 8), vec![5]);
-        assert_eq!(partition_sizes(9, 8), vec![4, 5]);
-        assert_eq!(partition_sizes(5, 4), vec![2, 3]);
-        assert_eq!(partition_sizes(9, 1), vec![1; 9]);
-        assert!(partition_sizes(17, 4).iter().all(|&s| (1..=4).contains(&s)));
-        assert_eq!(partition_sizes(17, 4).iter().sum::<usize>(), 17);
-    }
 
     /// Overwriting a key that is also a pivot must route the new message to
     /// the subtree on the pivot's RIGHT (SPEC pivot convention). If it were

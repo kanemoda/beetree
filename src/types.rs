@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Keys are arbitrary byte strings, ordered lexicographically.
@@ -18,7 +19,10 @@ pub type Value = Vec<u8>;
 /// leaves store materialized entries (`docs/SPEC.md`, "Semantics"). M0 is
 /// insert-only, so `Put` is the only message kind; deletes and upserts are
 /// future variants.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serde derives serve the on-disk node records (`docs/SPEC.md`, "On-disk
+/// format v1"): buffered messages persist inside internal-node records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
     /// Insert or overwrite the value for a key (last-writer-wins).
     Put {
@@ -49,7 +53,11 @@ impl Message {
 /// With F < 2, invariants I2 (k pivots ⇒ k+1 children) and I5 (fanout ≤ F)
 /// are jointly unsatisfiable for any internal node. Engines may panic on
 /// parameters outside these ranges.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serde derives serve the superblock (`docs/SPEC.md`, "On-disk format
+/// v1"): since M1.1 a database file persists its params; traces still
+/// travel them out-of-band (ADR-0006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Params {
     /// F: max children per internal node.
     pub fanout: usize,

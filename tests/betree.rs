@@ -169,6 +169,15 @@ fn regression_f2_ascending_inserts_survive_linear_height() {
     let mut tree = BeTree::new(params);
     for i in 0..3000u32 {
         tree.insert(i.to_be_bytes().to_vec(), vec![1]);
+        // Checking every op is quadratic on a tree whose node count is
+        // itself quadratic; every 64 ops still pins the invariants all the
+        // way up the degenerate spine. The stack-depth guard lives in the
+        // insert cascade itself (explicit frame stack, ADR-0005) and is not
+        // weakened by checking less often.
+        if i % 64 == 63 {
+            tree.check_invariants()
+                .expect("invariants green during the degenerate build");
+        }
     }
     tree.check_invariants()
         .expect("invariants green on the degenerate tall tree");
