@@ -22,14 +22,14 @@ use std::mem;
 use thiserror::Error;
 
 use crate::check::{self, NodeSource};
-use crate::engine::KvEngine;
+use crate::engine::{EngineError, KvEngine};
 use crate::format::{
     DATA_START, DiskNode, FORMAT_VERSION, MAGIC, RECORD_HEADER_SIZE, SUPERBLOCK_SLOT_SIZE,
     SUPERBLOCK_SLOTS, SlotStatus, Superblock, decode_node, encode_node,
 };
 use crate::node::{
-    Delivery, LeafEntry, Node, NodeId, Outcome, apply_chain, apply_to_leaf, coalesce_into,
-    partition_sizes, route,
+    Delivery, LeafEntry, Node, NodeId, Outcome, apply_chain, apply_to_leaf, bound_as_slice,
+    clip_lower, clip_upper, coalesce_into, partition_sizes, range_is_empty, route,
 };
 use crate::trace::{OpKind2, Recorder, TraceEvent, TraceEvent2};
 use crate::types::{InvariantViolation, Key, Message, Params, UpsertOp, Value};
@@ -523,6 +523,124 @@ impl<V: Vfs> DiskEngine<V> {
                         chain,
                         entries.get(key).map(|e| e.value.as_slice()),
                     ));
+                }
+            }
+        }
+    }
+
+    /// Every key in the range with its resolved value, in ascending key
+    /// order, reporting storage failures instead of panicking — the
+    /// fallible twin of [`KvEngine::scan`]. Loads nodes lazily as the
+    /// walk reaches them (the cold-cache path).
+    pub fn try_scan(
+        &mut self,
+        lo: std::ops::Bound<Vec<u8>>,
+        hi: std::ops::Bound<Vec<u8>>,
+    ) -> Result<Vec<(Key, Value)>, DiskError> {
+        self.trace.scan(&lo, &hi);
+        if range_is_empty(&lo, &hi) {
+            return Ok(Vec::new());
+        }
+        self.ensure_loaded(self.root)?;
+        // Root leaf: the entries are the terminal resolutions.
+        if let Node::Leaf { entries } = self.loaded(self.root) {
+            return Ok(entries
+                .range::<[u8], _>((bound_as_slice(&lo), bound_as_slice(&hi)))
+                .map(|(k, e)| (k.clone(), e.value.clone()))
+                .collect());
+        }
+        // Bottom-up application (SPEC "Range scans", normative), exactly
+        // as in `src/betree.rs`: clip top-down, apply upward — I3 makes
+        // every buffered message strictly newer than anything produced
+        // below, so depth order IS seq order. Explicit frames: degenerate
+        // F=2 trees are linearly tall.
+        struct Frame {
+            id: NodeId,
+            lo: std::ops::Bound<Key>,
+            hi: std::ops::Bound<Key>,
+            next_child: usize,
+            acc: BTreeMap<Key, Value>,
+        }
+        let mut stack = vec![Frame {
+            id: self.root,
+            lo,
+            hi,
+            next_child: 0,
+            acc: BTreeMap::new(),
+        }];
+        loop {
+            let frame = stack.len() - 1;
+            let i = stack[frame].next_child;
+            let Node::Internal {
+                pivots, children, ..
+            } = self.loaded(stack[frame].id)
+            else {
+                unreachable!("only internal nodes get frames; leaf children fold inline")
+            };
+            if i < children.len() {
+                stack[frame].next_child += 1;
+                let c_lo = if i == 0 {
+                    stack[frame].lo.clone()
+                } else {
+                    clip_lower(&stack[frame].lo, &pivots[i - 1])
+                };
+                let c_hi = if i == pivots.len() {
+                    stack[frame].hi.clone()
+                } else {
+                    clip_upper(&stack[frame].hi, &pivots[i])
+                };
+                if range_is_empty(&c_lo, &c_hi) {
+                    continue;
+                }
+                let child = children[i];
+                self.ensure_loaded(child)?;
+                match self.loaded(child) {
+                    Node::Leaf { entries } => {
+                        for (k, e) in
+                            entries.range::<[u8], _>((bound_as_slice(&c_lo), bound_as_slice(&c_hi)))
+                        {
+                            stack[frame].acc.insert(k.clone(), e.value.clone());
+                        }
+                    }
+                    Node::Internal { .. } => {
+                        stack.push(Frame {
+                            id: child,
+                            lo: c_lo,
+                            hi: c_hi,
+                            next_child: 0,
+                            acc: BTreeMap::new(),
+                        });
+                    }
+                }
+            } else {
+                let Node::Internal { buffer, .. } = self.loaded(stack[frame].id) else {
+                    unreachable!("checked above")
+                };
+                // Children done: fold this node's in-range messages onto
+                // their union (newer-over-older by I3).
+                let mut acc = mem::take(&mut stack[frame].acc);
+                let clip = (
+                    bound_as_slice(&stack[frame].lo),
+                    bound_as_slice(&stack[frame].hi),
+                );
+                for (k, message) in buffer.range::<[u8], _>(clip) {
+                    match message {
+                        Message::Put { value, .. } => {
+                            acc.insert(k.clone(), value.clone());
+                        }
+                        Message::Delete { .. } => {
+                            acc.remove(k);
+                        }
+                        Message::Upsert { op, .. } => {
+                            let value = op.apply(acc.get(k).map(|v| v.as_slice()));
+                            acc.insert(k.clone(), value);
+                        }
+                    }
+                }
+                stack.pop();
+                match stack.last_mut() {
+                    Some(parent) => parent.acc.append(&mut acc),
+                    None => return Ok(acc.into_iter().collect()),
                 }
             }
         }
@@ -1175,6 +1293,14 @@ impl<V: Vfs> KvEngine for DiskEngine<V> {
     fn get(&mut self, key: &[u8]) -> Option<Value> {
         self.try_get(key)
             .expect("storage failure during get (use try_get to handle it)")
+    }
+
+    fn scan(
+        &mut self,
+        lo: std::ops::Bound<Vec<u8>>,
+        hi: std::ops::Bound<Vec<u8>>,
+    ) -> Result<Vec<(Key, Value)>, EngineError> {
+        self.try_scan(lo, hi).map_err(EngineError::from)
     }
 
     /// Checks I1–I6 over the resident tree with the same shared checker as

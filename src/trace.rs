@@ -204,6 +204,15 @@ pub enum TraceEvent2 {
         /// The key probed.
         key: Key,
     },
+    /// A public range scan (M2.2). Seqno-free like every read; skipped by
+    /// replay; recorded only in the v2 trace (the v1 vocabulary is
+    /// closed; ADR-0013).
+    Scan {
+        /// The lower bound of the scanned range.
+        lo: std::ops::Bound<Key>,
+        /// The upper bound of the scanned range.
+        hi: std::ops::Bound<Key>,
+    },
     /// An internal node chose which child to flush its buffer toward
     /// (descriptive, not normative; skipped by replay).
     FlushDecision {
@@ -228,7 +237,9 @@ pub fn replay2<E: KvEngine>(params: Params, events: &[TraceEvent2]) -> E {
                 OpKind2::Delete { key } => engine.delete(key.clone()),
                 OpKind2::Upsert { key, op } => engine.upsert(key.clone(), *op),
             },
-            TraceEvent2::Get { .. } | TraceEvent2::FlushDecision { .. } => {}
+            TraceEvent2::Get { .. }
+            | TraceEvent2::Scan { .. }
+            | TraceEvent2::FlushDecision { .. } => {}
         }
     }
     engine
@@ -262,6 +273,15 @@ impl Recorder {
     pub fn get(&mut self, key: &[u8]) {
         self.v1.push(TraceEvent::Get { key: key.to_vec() });
         self.v2.push(TraceEvent2::Get { key: key.to_vec() });
+    }
+
+    /// Record a public range scan (v2 only: the closed v1 vocabulary has
+    /// no scan event; ADR-0013).
+    pub fn scan(&mut self, lo: &std::ops::Bound<Key>, hi: &std::ops::Bound<Key>) {
+        self.v2.push(TraceEvent2::Scan {
+            lo: lo.clone(),
+            hi: hi.clone(),
+        });
     }
 
     /// Record a flush decision.

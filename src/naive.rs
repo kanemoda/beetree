@@ -1,8 +1,10 @@
 //! A trivially correct reference engine backed by [`BTreeMap`].
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
-use crate::engine::KvEngine;
+use crate::engine::{EngineError, KvEngine};
+use crate::node::range_is_empty;
 use crate::trace::{OpKind2, Recorder, TraceEvent, TraceEvent2};
 use crate::types::{InvariantViolation, Key, Params, UpsertOp, Value};
 
@@ -71,6 +73,24 @@ impl KvEngine for NaiveEngine {
         );
         let value = op.apply(self.map.get(&key).map(|v| v.as_slice()));
         self.map.insert(key, value);
+    }
+
+    fn scan(
+        &mut self,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Vec<(Key, Value)>, EngineError> {
+        self.trace.scan(&lo, &hi);
+        // Guarded: BTreeMap::range panics on inverted bounds, which scan
+        // defines as the empty result.
+        if range_is_empty(&lo, &hi) {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .map
+            .range((lo, hi))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
     }
 
     fn get(&mut self, key: &[u8]) -> Option<Value> {

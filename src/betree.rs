@@ -10,12 +10,13 @@
 
 use std::collections::BTreeMap;
 use std::mem;
+use std::ops::Bound;
 
 use crate::check::{self, NodeSource};
-use crate::engine::KvEngine;
+use crate::engine::{EngineError, KvEngine};
 use crate::node::{
-    Delivery, LeafEntry, Node, NodeId, Outcome, apply_chain, apply_to_leaf, coalesce_into,
-    partition_sizes, route,
+    Delivery, LeafEntry, Node, NodeId, Outcome, apply_chain, apply_to_leaf, bound_as_slice,
+    clip_lower, clip_upper, coalesce_into, partition_sizes, range_is_empty, route,
 };
 use crate::trace::{OpKind2, Recorder, TraceEvent, TraceEvent2};
 use crate::types::{InvariantViolation, Key, Message, Params, UpsertOp, Value};
@@ -519,6 +520,120 @@ impl KvEngine for BeTree {
         self.apply_root(key, Message::Upsert { seq, op });
     }
 
+    fn scan(
+        &mut self,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Vec<(Key, Value)>, EngineError> {
+        self.trace.scan(&lo, &hi);
+        if range_is_empty(&lo, &hi) {
+            return Ok(Vec::new());
+        }
+        // Root leaf: the entries are the terminal resolutions.
+        if let Node::Leaf { entries } = &self.nodes[self.root as usize] {
+            return Ok(entries
+                .range::<[u8], _>((bound_as_slice(&lo), bound_as_slice(&hi)))
+                .map(|(k, e)| (k.clone(), e.value.clone()))
+                .collect());
+        }
+        // Bottom-up application (SPEC "Range scans", normative): recurse
+        // top-down clipping the range per child, but APPLY upward — each
+        // internal node folds its in-range buffered messages onto the
+        // union of its children's (disjoint, ordered) results. I3
+        // guarantees every message here is strictly newer than anything
+        // produced below, so plain overwrite/transform in depth order IS
+        // seq order. Explicit frames, not machine recursion: degenerate
+        // F=2 trees are linearly tall.
+        struct Frame {
+            id: NodeId,
+            lo: Bound<Key>,
+            hi: Bound<Key>,
+            next_child: usize,
+            acc: BTreeMap<Key, Value>,
+        }
+        let mut stack = vec![Frame {
+            id: self.root,
+            lo,
+            hi,
+            next_child: 0,
+            acc: BTreeMap::new(),
+        }];
+        loop {
+            let frame = stack.len() - 1;
+            let Node::Internal {
+                pivots,
+                children,
+                buffer,
+            } = &self.nodes[stack[frame].id as usize]
+            else {
+                unreachable!("only internal nodes get frames; leaf children fold inline")
+            };
+            let i = stack[frame].next_child;
+            if i < children.len() {
+                stack[frame].next_child += 1;
+                let c_lo = if i == 0 {
+                    stack[frame].lo.clone()
+                } else {
+                    clip_lower(&stack[frame].lo, &pivots[i - 1])
+                };
+                let c_hi = if i == pivots.len() {
+                    stack[frame].hi.clone()
+                } else {
+                    clip_upper(&stack[frame].hi, &pivots[i])
+                };
+                if range_is_empty(&c_lo, &c_hi) {
+                    continue;
+                }
+                match &self.nodes[children[i] as usize] {
+                    Node::Leaf { entries } => {
+                        for (k, e) in
+                            entries.range::<[u8], _>((bound_as_slice(&c_lo), bound_as_slice(&c_hi)))
+                        {
+                            stack[frame].acc.insert(k.clone(), e.value.clone());
+                        }
+                    }
+                    Node::Internal { .. } => {
+                        let id = children[i];
+                        stack.push(Frame {
+                            id,
+                            lo: c_lo,
+                            hi: c_hi,
+                            next_child: 0,
+                            acc: BTreeMap::new(),
+                        });
+                    }
+                }
+            } else {
+                // Children done: fold this node's in-range messages onto
+                // their union (newer-over-older by I3).
+                let mut acc = mem::take(&mut stack[frame].acc);
+                let clip = (
+                    bound_as_slice(&stack[frame].lo),
+                    bound_as_slice(&stack[frame].hi),
+                );
+                for (k, message) in buffer.range::<[u8], _>(clip) {
+                    match message {
+                        Message::Put { value, .. } => {
+                            acc.insert(k.clone(), value.clone());
+                        }
+                        Message::Delete { .. } => {
+                            acc.remove(k);
+                        }
+                        Message::Upsert { op, .. } => {
+                            let value = op.apply(acc.get(k).map(|v| v.as_slice()));
+                            acc.insert(k.clone(), value);
+                        }
+                    }
+                }
+                stack.pop();
+                match stack.last_mut() {
+                    Some(parent) => parent.acc.append(&mut acc),
+                    None => return Ok(acc.into_iter().collect()),
+                }
+            }
+        }
+    }
+
     fn get(&mut self, key: &[u8]) -> Option<Value> {
         self.trace.get(key);
         // Walk root→leaf accumulating the pending-upsert chain (SPEC,
@@ -894,8 +1009,15 @@ mod m21_tests {
             Node::Leaf { .. } => unreachable!(),
         }
 
-        // One get folds the whole stack: 10 + 20 + 30.
+        // One get folds the whole stack: 10 + 20 + 30 — and one scan
+        // folds it identically (M2.2, bottom-up application).
         assert_eq!(tree.get(&key), Some(le(60)));
+        let scanned = tree.scan(Bound::Unbounded, Bound::Unbounded).unwrap();
+        assert_eq!(
+            scanned.iter().find(|(k, _)| k == &key).map(|(_, v)| v),
+            Some(&le(60)),
+            "scan must fold the same 3-level upsert stack"
+        );
         tree.check_invariants().unwrap();
 
         println!(
@@ -909,5 +1031,322 @@ mod m21_tests {
         for event in &trace[trace.len().saturating_sub(8)..] {
             println!("  {event:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod m22_tests {
+    use super::*;
+
+    fn le(n: i64) -> Value {
+        n.to_le_bytes().to_vec()
+    }
+
+    /// Node ids along `key`'s root→leaf route.
+    fn route_path(tree: &BeTree, key: &[u8]) -> Vec<NodeId> {
+        let mut path = vec![tree.root];
+        let mut id = tree.root;
+        while let Node::Internal {
+            pivots, children, ..
+        } = &tree.nodes[id as usize]
+        {
+            id = children[route(pivots, key)];
+            path.push(id);
+        }
+        path
+    }
+
+    /// Drain every internal buffer on `key`'s path (white-box scaffolding;
+    /// see `m21_tests`).
+    fn drain_path_buffers(tree: &mut BeTree, key: &[u8]) {
+        for id in route_path(tree, key) {
+            if let Node::Internal { buffer, .. } = &mut tree.nodes[id as usize] {
+                buffer.clear();
+            }
+        }
+    }
+
+    /// Build a height-3 tree under B=1 (every flush controllable) over
+    /// 4-spaced u16 keys with LE values.
+    fn build_controlled() -> BeTree {
+        let params = Params {
+            fanout: 4,
+            buffer_capacity: 1,
+            leaf_capacity: 4,
+        };
+        let mut tree = BeTree::new(params);
+        let mut i = 0u16;
+        while tree.height() < 3 {
+            tree.insert((i * 4).to_be_bytes().to_vec(), le(i as i64));
+            i += 1;
+            assert!(i < 2000, "build phase failed to reach height 3");
+        }
+        tree
+    }
+
+    /// Whether `key` is buffered (as any message kind) at node `id`.
+    fn buffered_at(tree: &BeTree, id: NodeId, key: &[u8]) -> bool {
+        match &tree.nodes[id as usize] {
+            Node::Internal { buffer, .. } => buffer.contains_key(key),
+            Node::Leaf { .. } => false,
+        }
+    }
+
+    fn scan_all(tree: &mut BeTree) -> Vec<(Key, Value)> {
+        tree.scan(Bound::Unbounded, Bound::Unbounded).unwrap()
+    }
+
+    fn scan_has(scanned: &[(Key, Value)], key: &[u8]) -> bool {
+        scanned.iter().any(|(k, _)| k == key)
+    }
+
+    /// A tombstone in transit must suppress its key from scans at EVERY
+    /// level it rests at: root buffer, mid buffer, and finally the leaf
+    /// (where it annihilates).
+    #[test]
+    fn scan_suppresses_a_tombstone_at_every_level() {
+        let mut tree = build_controlled();
+
+        // The victim and two co-tenants of its leaf (pump fuel), plus a
+        // key under the mid node's next-lower child (parking fuel).
+        let victim_path = route_path(&tree, &40u16.to_be_bytes());
+        let leaf = *victim_path.last().unwrap();
+        let mid = victim_path[1];
+        let Node::Leaf { entries } = &tree.nodes[leaf as usize] else {
+            unreachable!()
+        };
+        assert!(entries.len() >= 3, "need a victim plus two pump keys");
+        let mut keys = entries.keys().cloned();
+        let victim = keys.next().unwrap();
+        let pump_a = keys.next().unwrap();
+        let pump_b = keys.next().unwrap();
+        let Node::Internal {
+            pivots, children, ..
+        } = &tree.nodes[mid as usize]
+        else {
+            unreachable!()
+        };
+        let g = route(pivots, &victim);
+        assert!(g >= 1, "victim must have a lower sibling at the mid node");
+        let mut probe = children[g - 1];
+        let parking_fuel = loop {
+            match &tree.nodes[probe as usize] {
+                Node::Internal { children, .. } => probe = children[0],
+                Node::Leaf { entries } => break entries.keys().next().unwrap().clone(),
+            }
+        };
+
+        // Level 1: tombstone resting in the ROOT buffer.
+        drain_path_buffers(&mut tree, &victim);
+        tree.delete(victim.clone());
+        assert!(buffered_at(&tree, tree.root, &victim));
+        let scanned = scan_all(&mut tree);
+        assert!(!scan_has(&scanned, &victim), "root tombstone must suppress");
+        assert_eq!(tree.get(&victim), None);
+
+        // Level 2: parked in the MID buffer (the parking fuel flushes
+        // first on the tie-break, stranding the tombstone).
+        tree.insert(parking_fuel.clone(), b"fuel".to_vec());
+        let mid = route_path(&tree, &victim)[1];
+        assert!(
+            buffered_at(&tree, mid, &victim),
+            "the tombstone must be parked at the mid level"
+        );
+        let scanned = scan_all(&mut tree);
+        assert!(!scan_has(&scanned, &victim), "mid tombstone must suppress");
+        assert_eq!(tree.get(&victim), None);
+
+        // Level 3: driven into the leaf, where it annihilates.
+        tree.insert(pump_a.clone(), b"fuel2".to_vec());
+        tree.insert(pump_b.clone(), b"fuel3".to_vec());
+        let path = route_path(&tree, &victim);
+        let leaf = *path.last().unwrap();
+        assert!(
+            !path.iter().any(|&id| buffered_at(&tree, id, &victim)),
+            "no tombstone may remain buffered on the path"
+        );
+        match &tree.nodes[leaf as usize] {
+            Node::Leaf { entries } => assert!(!entries.contains_key(&victim)),
+            Node::Internal { .. } => unreachable!(),
+        }
+        let scanned = scan_all(&mut tree);
+        assert!(!scan_has(&scanned, &victim), "annihilated key stays gone");
+        tree.check_invariants().unwrap();
+    }
+
+    /// The report excerpt: ONE scan resolving both a 3-level upsert stack
+    /// and a tombstone-in-transit in a single pass, printed with the
+    /// trace2 tail (`--nocapture`).
+    #[test]
+    fn scan_resolves_stack_and_tombstone_in_one_pass() {
+        let mut tree = build_controlled();
+
+        // A 3-level upsert stack on a never-inserted key (as in
+        // m21_tests::upsert_stack_across_three_levels_resolves_on_get).
+        let (key, mid) = (1u16..2000)
+            .step_by(2)
+            .find_map(|k| {
+                let key = k.to_be_bytes().to_vec();
+                let path = route_path(&tree, &key);
+                let mid = path[1];
+                let Node::Internal { pivots, .. } = &tree.nodes[mid as usize] else {
+                    return None;
+                };
+                (route(pivots, &key) >= 1).then_some((key, mid))
+            })
+            .expect("some key has a lower sibling at depth 2");
+        let path = route_path(&tree, &key);
+        let leaf = *path.last().unwrap();
+        let Node::Leaf { entries } = &tree.nodes[leaf as usize] else {
+            unreachable!()
+        };
+        let w = entries.keys().next().expect("leaves are non-empty").clone();
+        let Node::Internal {
+            pivots, children, ..
+        } = &tree.nodes[mid as usize]
+        else {
+            unreachable!()
+        };
+        let mut probe = children[route(pivots, &key) - 1];
+        let w2 = loop {
+            match &tree.nodes[probe as usize] {
+                Node::Internal { children, .. } => probe = children[0],
+                Node::Leaf { entries } => break entries.keys().next().unwrap().clone(),
+            }
+        };
+        drain_path_buffers(&mut tree, &key);
+        tree.upsert(key.clone(), UpsertOp::Add(10));
+        tree.insert(w.clone(), b"pump".to_vec());
+        drain_path_buffers(&mut tree, &key);
+        tree.upsert(key.clone(), UpsertOp::Add(20));
+        tree.insert(w2.clone(), b"pump".to_vec());
+        tree.upsert(key.clone(), UpsertOp::Add(30));
+
+        // A tombstone in transit: delete an existing key far from `key`'s
+        // subtree; it rests in the root buffer.
+        let victim = {
+            let Node::Internal { children, .. } = &tree.nodes[tree.root as usize] else {
+                unreachable!()
+            };
+            let other = *children
+                .iter()
+                .find(|&&c| c != route_path(&tree, &key)[1])
+                .expect("the root has more than one child");
+            let mut probe = other;
+            loop {
+                match &tree.nodes[probe as usize] {
+                    Node::Internal { children, .. } => probe = children[0],
+                    Node::Leaf { entries } => break entries.keys().next().unwrap().clone(),
+                }
+            }
+        };
+        tree.delete(victim.clone());
+        assert!(buffered_at(&tree, tree.root, &victim));
+
+        // ONE scan resolves both in a single bottom-up pass. The trace
+        // excerpt is captured immediately, before the verification gets
+        // append their own events.
+        let scanned = scan_all(&mut tree);
+        println!(
+            "one-pass scan: upsert stack on {key:?} folded to 60; \
+             in-transit tombstone on {victim:?} suppressed; \
+             {} keys returned",
+            scanned.len()
+        );
+        let trace = tree.trace2();
+        println!("trace2 excerpt (last 7 events, ending in the scan):");
+        for event in &trace[trace.len().saturating_sub(7)..] {
+            println!("  {event:?}");
+        }
+
+        assert_eq!(
+            scanned.iter().find(|(k, _)| k == &key).map(|(_, v)| v),
+            Some(&le(60)),
+            "the scan must fold the 3-level upsert stack"
+        );
+        assert!(
+            !scan_has(&scanned, &victim),
+            "the scan must suppress the in-transit tombstone"
+        );
+        // Scan agrees with get on every scanned key.
+        for (k, v) in &scanned {
+            assert_eq!(tree.get(k), Some(v.clone()), "scan/get diverge at {k:?}");
+        }
+        assert_eq!(tree.get(&victim), None);
+        tree.check_invariants().unwrap();
+    }
+
+    /// Scan across a leaf boundary and a reclamation-produced gap: empty
+    /// out a middle leaf, let reclamation absorb its range, then scan
+    /// straddling the gap — neighbors only, no phantoms, no misses.
+    #[test]
+    fn scan_spans_leaf_boundaries_and_reclamation_gaps() {
+        let mut tree = build_controlled();
+        let mut oracle: BTreeMap<Key, Value> = BTreeMap::new();
+        for id in 0..tree.nodes.len() as NodeId {
+            if let Node::Leaf { entries } = &tree.nodes[id as usize] {
+                if route_path(&tree, entries.keys().next().unwrap()).last() == Some(&id) {
+                    for (k, e) in entries {
+                        oracle.insert(k.clone(), e.value.clone());
+                    }
+                }
+            }
+        }
+
+        // The middle leaf of `mid`'s children empties and gets absorbed.
+        let probe_key = 40u16.to_be_bytes().to_vec();
+        let mid = route_path(&tree, &probe_key)[1];
+        let Node::Internal { children, .. } = &tree.nodes[mid as usize] else {
+            unreachable!()
+        };
+        assert!(children.len() >= 3, "need a genuine middle leaf");
+        let gap_leaf = children[1];
+        let Node::Leaf { entries } = &tree.nodes[gap_leaf as usize] else {
+            unreachable!()
+        };
+        let gap_keys: Vec<Key> = entries.keys().cloned().collect();
+        for k in &gap_keys {
+            oracle.remove(k);
+            tree.delete(k.clone());
+        }
+        // Drive the resting tombstones down until the leaf is reclaimed
+        // (idempotent re-deletes; SPEC "Reclamation v1" caveat).
+        let mut rounds = 0;
+        while route_path(&tree, &gap_keys[0]).contains(&gap_leaf) {
+            rounds += 1;
+            assert!(rounds <= 8, "reclamation failed to converge");
+            for k in &gap_keys {
+                tree.delete(k.clone());
+            }
+        }
+        tree.check_invariants().unwrap();
+
+        // Full scan equals the oracle exactly (boundary keys included).
+        let scanned = scan_all(&mut tree);
+        let expected: Vec<(Key, Value)> =
+            oracle.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(scanned, expected, "full scan across the gap diverged");
+
+        // A narrow scan straddling the absorbed range: from the last
+        // surviving key below the gap to the first above it.
+        let below = oracle.range(..gap_keys[0].clone()).next_back().unwrap();
+        let above = oracle
+            .range(gap_keys.last().unwrap().clone()..)
+            .next()
+            .unwrap();
+        let narrow = tree
+            .scan(
+                Bound::Included(below.0.clone()),
+                Bound::Included(above.0.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            narrow,
+            vec![
+                (below.0.clone(), below.1.clone()),
+                (above.0.clone(), above.1.clone())
+            ],
+            "the straddling scan must return exactly the gap's neighbors"
+        );
     }
 }

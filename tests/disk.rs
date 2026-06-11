@@ -54,6 +54,14 @@ impl KvEngine for TempDiskEngine {
         self.engine.get(key)
     }
 
+    fn scan(
+        &mut self,
+        lo: std::ops::Bound<Vec<u8>>,
+        hi: std::ops::Bound<Vec<u8>>,
+    ) -> Result<Vec<(Key, Value)>, beetree::EngineError> {
+        self.engine.scan(lo, hi)
+    }
+
     fn check_invariants(&self) -> Result<(), beetree::InvariantViolation> {
         self.engine.check_invariants()
     }
@@ -532,6 +540,55 @@ fn delete_all_commits_an_empty_tree() {
     let mut engine = DiskEngine::open(&path).unwrap();
     assert_eq!(engine.get(&[42]), Some(b"reborn".to_vec()));
     assert_eq!(engine.get(&[43, 43]), Some(5i64.to_le_bytes().to_vec()));
+}
+
+/// Cold-cache scan (M2.2): build a mixed-state tree, commit, drop,
+/// reopen, and scan the full domain BEFORE any get — every node loads
+/// lazily inside the scan path itself, and the result matches the oracle.
+#[test]
+fn cold_cache_scan_after_reopen() {
+    use std::ops::Bound;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(&dir);
+    let mut engine = DiskEngine::create(&path, Params::default()).unwrap();
+    let mut oracle: BTreeMap<Key, Value> = BTreeMap::new();
+    for b in 0..=255u8 {
+        engine.insert(vec![b], vec![b, b]);
+        oracle.insert(vec![b], vec![b, b]);
+    }
+    for b in (0..=255u8).step_by(3) {
+        engine.delete(vec![b]);
+        oracle.remove(&vec![b]);
+    }
+    for b in (0..=255u8).step_by(5) {
+        engine.upsert(vec![b], beetree::UpsertOp::Add(7));
+        let v = beetree::UpsertOp::Add(7).apply(oracle.get(&vec![b]).map(|v| v.as_slice()));
+        oracle.insert(vec![b], v);
+    }
+    engine.commit().unwrap();
+    drop(engine);
+
+    let mut engine = DiskEngine::open(&path).unwrap();
+    let scanned = engine
+        .scan(Bound::Unbounded, Bound::Unbounded)
+        .expect("cold scan must lazy-load cleanly");
+    let expected: Vec<(Key, Value)> = oracle.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    assert_eq!(scanned, expected, "cold-cache scan diverged from oracle");
+
+    // A bounded cold scan on a second fresh reopen, for the clipped path.
+    drop(engine);
+    let mut engine = DiskEngine::open(&path).unwrap();
+    let narrow = engine
+        .scan(Bound::Included(vec![50]), Bound::Excluded(vec![100]))
+        .unwrap();
+    let expected: Vec<(Key, Value)> = oracle
+        .range(vec![50]..vec![100])
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    assert_eq!(narrow, expected, "bounded cold scan diverged");
+    engine.load_all().unwrap();
+    engine.check_invariants().unwrap();
 }
 
 /// Seqnos continue across reopen (the superblock's `last_seq`): the first

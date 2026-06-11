@@ -1,7 +1,8 @@
-# beetree specification — M0 + M1 + M2.1
+# beetree specification — M0 + M1 + M2
 
 This document is normative for milestones M0 (in-memory engine), M1
-(persistence and crash safety), and M2.1 (deletes, upserts, reclamation).
+(persistence and crash safety), and M2 (deletes, upserts, reclamation,
+range scans).
 The byte-frozen property-test harness in `tests/harness.rs` enforces the
 insert-only semantics mechanically; the full-mix harness in
 `tests/harness2.rs` (frozen when M2.2 ships) enforces the complete op
@@ -67,6 +68,37 @@ Delete (apply the chain to base 0 if the chain is non-empty, else None), a
 leaf entry (apply the chain), or leaf-absent (chain non-empty → the value
 of the chain from base 0; chain empty → None). An empty chain returns the
 terminal value untouched.
+
+### Range scans (M2.2, normative)
+
+`scan(&mut self, lo: Bound<Vec<u8>>, hi: Bound<Vec<u8>>) ->
+Result<Vec<(Key, Value)>, EngineError>` joins `KvEngine`: every key in
+the range with its resolved value, ascending. Collect semantics — a
+streaming cursor is explicitly deferred (ADR-0014). An inverted range is
+the empty result, never a panic.
+
+Algorithm ("bottom-up application"): recurse top-down clipping the range
+per child, but APPLY upward —
+
+- leaf: emit entries within range (terminal resolutions);
+- internal: union the children's (disjoint, ordered) results, then apply
+  this node's in-range buffered messages onto that result: Put(v) → set;
+  Delete → remove; Upsert(d) → transform (absent ⇒ base 0).
+
+Correctness: I3 guarantees every message at a node is strictly newer than
+anything produced below it, so plain overwrite/transform in depth order
+IS seq order. The implementations use explicit frames, not machine
+recursion (degenerate F=2 trees are linearly tall).
+
+Semantic consequences, all property-tested (Q6): keys whose resolution is
+Delete do NOT appear; keys that only ever received Upserts DO appear
+(value folded from base 0) — scan agrees with `get` on every key; and
+tombstones and upserts still in transit (resting in buffers) are
+correctly folded.
+
+Scans are traced as seqno-free `TraceEvent2::Scan { lo, hi }` events,
+ignored by `replay2` and absent from the closed v1 vocabulary; Q5 is
+unchanged (scans are not ops).
 
 ## Structure parameters (Params)
 
@@ -229,12 +261,16 @@ passes the frozen harness via a thin tempdir wrapper (`tests/disk.rs`).
   the same error/poisoning semantics as `try_insert`.
 - The trace API is SPLIT (ADR-0013): the byte-frozen M0 harness matches
   exhaustively over `TraceEvent`/`OpKind`, closing those enums, so the
-  full vocabulary lives in `TraceEvent2`/`OpKind2`. `trace()` keeps
-  returning the v1 view — faithful for insert-only workloads, silently
-  omitting deletes and upserts — and `trace2()` is the complete record;
-  `replay2` is the only replay that is faithful for mixed workloads.
-- `tests/harness2.rs` is the full-mix harness (Q1–Q5, mirroring P1–P5
-  over insert/delete/upsert/get); it freezes when M2.2 ships.
+  full vocabulary lives in `TraceEvent2`/`OpKind2`. As of M2.2,
+  `TraceEvent2`/`OpKind2` are the CANONICAL trace vocabulary;
+  `trace()`'s v1 view is a legacy projection, faithful for insert-only
+  workloads only (it silently omits deletes, upserts, and scans).
+  `trace2()` is the complete record; `replay2` is the only replay that is
+  faithful for mixed workloads.
+- `tests/harness2.rs` is the full-mix harness (Q1–Q6, mirroring and
+  extending P1–P5 over insert/delete/upsert/get/scan); FROZEN as of M2.2
+  — byte-identical from here on, hash in the README freeze table beside
+  `tests/harness.rs`.
 
 ## On-disk format v2 (M1.1, revised M2.1, normative)
 
@@ -383,3 +419,10 @@ memory budgets (M3 — loaded nodes stay resident).
 Range scans (M2.2), occupancy-based rebalancing/merges beyond Reclamation
 v1, additional `UpsertOp` variants, on-disk space reclamation, freezing
 `tests/harness2.rs` (that happens when M2.2 ships).
+
+## Out of scope in M2.2
+
+Streaming scan cursors (ADR-0014), reverse scans, retiring the v1 trace
+view (deferred to a polish milestone together with a single documented
+harness re-baseline; docs/findings.md, "Deferred decisions"), cache
+eviction and memory budgets (M3).

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::ops::Bound;
 
 use serde::{Deserialize, Serialize};
 
@@ -140,6 +141,46 @@ pub(crate) fn apply_chain(chain: Option<i64>, existing: Option<&[u8]>) -> Option
     match chain {
         None => existing.map(<[u8]>::to_vec),
         Some(sum) => Some(UpsertOp::Add(sum).apply(existing)),
+    }
+}
+
+/// Is the range `(lo, hi)` provably empty? Covers inverted bounds and the
+/// zero-width cases with an exclusion — exactly the inputs
+/// `BTreeMap::range` would panic on, plus the trivially empty ones, so a
+/// guarded caller can hand any remaining range straight to `range()`.
+pub(crate) fn range_is_empty(lo: &Bound<Key>, hi: &Bound<Key>) -> bool {
+    match (lo, hi) {
+        (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) => {
+            a > b
+                || (a == b
+                    && (matches!(lo, Bound::Excluded(_)) || matches!(hi, Bound::Excluded(_))))
+        }
+        _ => false,
+    }
+}
+
+/// Intersect a lower bound with a child's pivot floor: max(lo, [pivot, …).
+pub(crate) fn clip_lower(lo: &Bound<Key>, pivot: &[u8]) -> Bound<Key> {
+    match lo {
+        Bound::Included(a) | Bound::Excluded(a) if a.as_slice() >= pivot => lo.clone(),
+        _ => Bound::Included(pivot.to_vec()),
+    }
+}
+
+/// Intersect an upper bound with a child's pivot ceiling: min(hi, …, pivot).
+pub(crate) fn clip_upper(hi: &Bound<Key>, pivot: &[u8]) -> Bound<Key> {
+    match hi {
+        Bound::Included(b) | Bound::Excluded(b) if b.as_slice() < pivot => hi.clone(),
+        _ => Bound::Excluded(pivot.to_vec()),
+    }
+}
+
+/// A bound viewed as a byte slice, for `BTreeMap::range::<[u8], _>`.
+pub(crate) fn bound_as_slice(bound: &Bound<Key>) -> Bound<&[u8]> {
+    match bound {
+        Bound::Unbounded => Bound::Unbounded,
+        Bound::Included(k) => Bound::Included(k.as_slice()),
+        Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
     }
 }
 

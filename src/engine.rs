@@ -1,7 +1,20 @@
 //! The engine interface every key-value implementation must satisfy.
 
+use std::ops::Bound;
+
+use thiserror::Error;
+
 use crate::trace::{TraceEvent, TraceEvent2};
 use crate::types::{InvariantViolation, Key, Params, UpsertOp, Value};
+
+/// Why a fallible engine operation failed. The in-memory engines never
+/// fail; the disk engine surfaces storage errors (corruption included).
+#[derive(Debug, Error)]
+pub enum EngineError {
+    /// The storage layer failed ([`DiskEngine`](crate::DiskEngine) only).
+    #[error(transparent)]
+    Storage(#[from] crate::disk::DiskError),
+}
 
 /// A single-threaded key-value engine (`docs/SPEC.md`; inserts since M0,
 /// deletes and upserts since M2.1).
@@ -33,6 +46,22 @@ pub trait KvEngine {
     /// deleted keys transform from the empty base (`docs/SPEC.md`,
     /// "Upsert semantics"). Consumes a seqno; recorded and replayed.
     fn upsert(&mut self, key: Key, op: UpsertOp);
+
+    /// Every key in `[lo, hi]` (per the bound kinds) with its resolved
+    /// value, in ascending key order (M2.2; `docs/SPEC.md`, "Range
+    /// scans"). Inverted bounds yield an empty result. Scan agrees with
+    /// `get` on every key: in-transit tombstones suppress keys, pending
+    /// upsert stacks fold (a key that only ever received upserts appears,
+    /// folded from base 0).
+    ///
+    /// Collect semantics — the full result is materialized; a streaming
+    /// cursor is deliberately deferred (ADR-0014). Records a seqno-free
+    /// [`TraceEvent2::Scan`]; `replay2` skips it.
+    fn scan(
+        &mut self,
+        lo: Bound<Vec<u8>>,
+        hi: Bound<Vec<u8>>,
+    ) -> Result<Vec<(Key, Value)>, EngineError>;
 
     /// The newest value for `key` under the full message algebra: `None`
     /// for a key never written OR deleted since; a deleted-then-upserted

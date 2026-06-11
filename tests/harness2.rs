@@ -1,13 +1,16 @@
-//! The full-op-mix property harness (M2.1): Q1–Q5 over
-//! insert/delete/upsert/get, generic over [`KvEngine`].
+//! The full-op-mix property harness (M2.1–M2.2): Q1–Q6 over
+//! insert/delete/upsert/get/scan, generic over [`KvEngine`].
 //!
 //! Mirrors the byte-frozen M0 harness (`tests/harness.rs`) — which stays
-//! the compatibility gate for the insert-only surface — and adds the M2.1
-//! vocabulary via `trace2`/`replay2` (ADR-0013). NOT frozen until M2.2
-//! ships. Instantiated below for NaiveEngine, BeTree, and DiskEngine (via
-//! a tempdir wrapper).
+//! the compatibility gate for the insert-only surface — and adds the
+//! M2 vocabulary via `trace2`/`replay2`/`scan` (ADR-0013, ADR-0014).
+//! FROZEN as of M2.2: this file must stay byte-identical (hash in the
+//! README freeze table); future engines instantiate it from their own
+//! test files exactly like `tests/harness.rs`. Instantiated below for
+//! NaiveEngine, BeTree, and DiskEngine (via a tempdir wrapper).
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 use beetree::{
     DiskEngine, FileVfs, Key, KvEngine, OpKind2, Params, TraceEvent2, UpsertOp, Value, replay2,
@@ -87,8 +90,20 @@ pub(crate) fn apply_oracle2(oracle: &mut BTreeMap<Key, Value>, op: &Op2) {
             oracle.remove(key);
         }
         Op2::Upsert { key, delta } => {
-            let value = UpsertOp::Add(*delta).apply(oracle.get(key).map(|v| v.as_slice()));
-            oracle.insert(key.clone(), value);
+            // Deliberately independent of the crate's UpsertOp::apply
+            // (which every engine routes through): the oracle restates
+            // the SPEC Add semantics from scratch, so a regression in the
+            // canonical fold cannot hide in lockstep.
+            let base = match oracle.get(key) {
+                Some(v) if v.len() == 8 => {
+                    i64::from_le_bytes(v.as_slice().try_into().expect("8 bytes"))
+                }
+                _ => 0,
+            };
+            oracle.insert(
+                key.clone(),
+                base.wrapping_add(*delta).to_le_bytes().to_vec(),
+            );
         }
     }
 }
@@ -196,7 +211,9 @@ pub(crate) fn check_q5_trace_well_formedness<E: KvEngine>(
         .iter()
         .filter_map(|event| match event {
             TraceEvent2::Op { seq, op } => Some((*seq, op)),
-            TraceEvent2::Get { .. } | TraceEvent2::FlushDecision { .. } => None,
+            TraceEvent2::Get { .. }
+            | TraceEvent2::Scan { .. }
+            | TraceEvent2::FlushDecision { .. } => None,
         })
         .collect();
     prop_assert_eq!(
@@ -240,7 +257,159 @@ pub(crate) fn check_q5_trace_well_formedness<E: KvEngine>(
     Ok(())
 }
 
-/// Instantiate the full Q1–Q5 harness for an engine type:
+/// One step of a Q6 workload: a mutating op or an interleaved scan.
+#[derive(Debug, Clone)]
+pub(crate) enum Step6 {
+    Op(Op2),
+    Scan(Bound<Key>, Bound<Key>),
+}
+
+/// Bound keys range over 0..=2 bytes — deliberately WIDER than the
+/// single-byte key domain: the empty key, exact domain keys, and 2-byte
+/// keys that fall strictly between domain keys or stand in prefix
+/// relation to pivots all exercise the length-asymmetric lexicographic
+/// comparisons in the engines' clipping logic.
+fn bound_key_strategy() -> impl Strategy<Value = Key> {
+    proptest::collection::vec(any::<u8>(), 0..=2)
+}
+
+fn bound_strategy() -> impl Strategy<Value = Bound<Key>> {
+    prop_oneof![
+        bound_key_strategy().prop_map(Bound::Included),
+        bound_key_strategy().prop_map(Bound::Excluded),
+        Just(Bound::Unbounded),
+    ]
+}
+
+fn steps6_with(wi: u32, wd: u32, wu: u32) -> impl Strategy<Value = Vec<Step6>> {
+    proptest::collection::vec(
+        prop_oneof![
+            7 => op2_strategy(wi, wd, wu).prop_map(Step6::Op),
+            1 => (bound_strategy(), bound_strategy())
+                .prop_map(|(lo, hi)| Step6::Scan(lo, hi)),
+        ],
+        0..=1500,
+    )
+}
+
+/// Q6 workloads: the same three weightings as Q1–Q5 (balanced,
+/// delete-heavy so scans hit reclaimed structure, upsert-heavy so scans
+/// fold deep pending stacks), with scans sprinkled in. Random bounds
+/// cover every Included/Excluded/Unbounded combination — including
+/// inverted ranges (empty) and double-Unbounded (full domain).
+pub(crate) fn steps6_strategy() -> impl Strategy<Value = Vec<Step6>> {
+    prop_oneof![
+        steps6_with(5, 2, 2),
+        steps6_with(2, 6, 1),
+        steps6_with(2, 1, 6),
+    ]
+}
+
+/// Does `key` lie within `(lo, hi)`? (The oracle-side bound predicate;
+/// deliberately independent of the engines' range plumbing.)
+fn in_bounds(key: &[u8], lo: &Bound<Key>, hi: &Bound<Key>) -> bool {
+    let lo_ok = match lo {
+        Bound::Unbounded => true,
+        Bound::Included(a) => key >= a.as_slice(),
+        Bound::Excluded(a) => key > a.as_slice(),
+    };
+    let hi_ok = match hi {
+        Bound::Unbounded => true,
+        Bound::Included(b) => key <= b.as_slice(),
+        Bound::Excluded(b) => key < b.as_slice(),
+    };
+    lo_ok && hi_ok
+}
+
+/// Q6: scan equivalence — every interleaved scan returns exactly the
+/// oracle's in-range contents in ascending key order, AND agrees with
+/// per-key `get` over the domain∩range (in-transit tombstones suppress,
+/// pending upsert stacks fold; SPEC "Range scans").
+pub(crate) fn check_q6_scan_equivalence<E: KvEngine>(steps: &[Step6]) -> Result<(), TestCaseError> {
+    let mut engine = E::new(Params::default());
+    let mut oracle = BTreeMap::new();
+    for (i, step) in steps.iter().enumerate() {
+        match step {
+            Step6::Op(op) => {
+                apply2(&mut engine, op);
+                apply_oracle2(&mut oracle, op);
+            }
+            Step6::Scan(lo, hi) => {
+                let got = match engine.scan(lo.clone(), hi.clone()) {
+                    Ok(got) => got,
+                    Err(e) => {
+                        return Err(TestCaseError::fail(format!(
+                            "Q6: scan {lo:?}..{hi:?} failed at step {i}: {e}"
+                        )));
+                    }
+                };
+                let expected: Vec<(Key, Value)> = oracle
+                    .iter()
+                    .filter(|(k, _)| in_bounds(k, lo, hi))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                prop_assert_eq!(
+                    &got,
+                    &expected,
+                    "Q6: scan {:?}..{:?} diverged from the oracle at step {}",
+                    lo,
+                    hi,
+                    i
+                );
+                // And scan must agree with get, key by key, over the
+                // domain ∩ range.
+                let by_key: BTreeMap<&Key, &Value> = got.iter().map(|(k, v)| (k, v)).collect();
+                for key in full_domain().filter(|k| in_bounds(k, lo, hi)) {
+                    prop_assert_eq!(
+                        by_key.get(&key).map(|v| (*v).clone()),
+                        engine.get(&key),
+                        "Q6: scan and get disagree on {:?} (step {})",
+                        &key,
+                        i
+                    );
+                }
+            }
+        }
+    }
+    // The scan trace contract (SPEC "Range scans"): every mutating step
+    // is exactly one Op event with seqnos contiguous from 1 — scans
+    // consume NO seqno — and every scan is recorded as exactly one
+    // seqno-free Scan event.
+    let n_ops = steps.iter().filter(|s| matches!(s, Step6::Op(_))).count();
+    let n_scans = steps
+        .iter()
+        .filter(|s| matches!(s, Step6::Scan(..)))
+        .count();
+    let mut op_events = 0usize;
+    let mut scan_events = 0usize;
+    for event in engine.trace2() {
+        match event {
+            TraceEvent2::Op { seq, .. } => {
+                op_events += 1;
+                prop_assert_eq!(
+                    *seq,
+                    op_events as u64,
+                    "Q6: op seqnos must stay contiguous around scans"
+                );
+            }
+            TraceEvent2::Scan { .. } => scan_events += 1,
+            TraceEvent2::Get { .. } | TraceEvent2::FlushDecision { .. } => {}
+        }
+    }
+    prop_assert_eq!(
+        op_events,
+        n_ops,
+        "Q6: every mutating step is exactly one Op event (scans are not ops)"
+    );
+    prop_assert_eq!(
+        scan_events,
+        n_scans,
+        "Q6: every scan is recorded exactly once, seqno-free"
+    );
+    Ok(())
+}
+
+/// Instantiate the full Q1–Q6 harness for an engine type:
 /// `instantiate_harness2!(module_name, EngineType);`
 macro_rules! instantiate_harness2 {
     ($module:ident, $engine:ty) => {
@@ -271,6 +440,11 @@ macro_rules! instantiate_harness2 {
                 #[test]
                 fn q5_trace_well_formedness(ops in ops2_strategy()) {
                     check_q5_trace_well_formedness::<$engine>(&ops)?;
+                }
+
+                #[test]
+                fn q6_scan_equivalence(steps in steps6_strategy()) {
+                    check_q6_scan_equivalence::<$engine>(&steps)?;
                 }
             }
         }
@@ -306,6 +480,14 @@ impl KvEngine for TempDiskEngine2 {
 
     fn get(&mut self, key: &[u8]) -> Option<Value> {
         self.engine.get(key)
+    }
+
+    fn scan(
+        &mut self,
+        lo: std::ops::Bound<Vec<u8>>,
+        hi: std::ops::Bound<Vec<u8>>,
+    ) -> Result<Vec<(Key, Value)>, beetree::EngineError> {
+        self.engine.scan(lo, hi)
     }
 
     fn check_invariants(&self) -> Result<(), beetree::InvariantViolation> {

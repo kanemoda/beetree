@@ -240,6 +240,10 @@ struct CaseCtx<'a> {
     keys: &'a BTreeSet<Key>,
     live_ops: &'a [(Key, Value)],
     images: &'a AtomicU64,
+    /// When set, A2 compares via a single full-domain SCAN as the
+    /// recovered engine's very first operation (M2.2): recovery must
+    /// yield a scannable tree, not just a gettable one.
+    a2_via_scan: bool,
 }
 
 fn sweep(
@@ -292,12 +296,33 @@ fn check_image(ctx: &CaseCtx, pos: usize, fates: &[Fate]) -> Result<(), TestCase
         g < ctx.snapshots.len(),
         "A2: recovered unknown generation {g} (crash pos {pos})"
     );
-    sweep(
-        &mut eng,
-        &ctx.snapshots[g],
-        ctx.keys,
-        &format!("A2 (gen {g}, pos {pos})"),
-    )?;
+    if ctx.a2_via_scan {
+        // The engine's FIRST operation is a full-domain scan: lazy loads
+        // happen inside the scan path itself.
+        match eng.scan(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded) {
+            Ok(got) => {
+                let want: Vec<(Key, Value)> = ctx.snapshots[g]
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                prop_assert_eq!(
+                    &got,
+                    &want,
+                    "A2-scan: full-domain scan diverged from generation {} (pos {})",
+                    g,
+                    pos
+                );
+            }
+            Err(e) => prop_assert!(false, "A2-scan: scan failed at pos {}: {}", pos, e),
+        }
+    } else {
+        sweep(
+            &mut eng,
+            &ctx.snapshots[g],
+            ctx.keys,
+            &format!("A2 (gen {g}, pos {pos})"),
+        )?;
+    }
 
     // A3: no fully-synced commit may be lost.
     let fully_synced = ctx
@@ -384,7 +409,7 @@ fn tear_grid() -> Vec<Fate> {
 
 /// Run one full crash case: workload, oracle snapshots, crash points,
 /// images, idempotent recovery.
-fn run_case(case: &CrashCase, images: &AtomicU64) -> Result<(), TestCaseError> {
+fn run_case(case: &CrashCase, images: &AtomicU64, a2_via_scan: bool) -> Result<(), TestCaseError> {
     let vfs = FaultyVfs::new();
     let h = vfs.clone();
     let mut engine = DiskEngine::create_on(vfs, Params::default())
@@ -440,6 +465,7 @@ fn run_case(case: &CrashCase, images: &AtomicU64) -> Result<(), TestCaseError> {
         keys: &keys,
         live_ops: &case.live_ops,
         images,
+        a2_via_scan,
     };
 
     // C=6 uniform crash positions, R=6 images each.
@@ -507,7 +533,7 @@ fn run_case(case: &CrashCase, images: &AtomicU64) -> Result<(), TestCaseError> {
     Ok(())
 }
 
-fn run_crash_suite(name: &str, strategy: impl Strategy<Value = CrashCase>) {
+fn run_crash_suite(name: &str, strategy: impl Strategy<Value = CrashCase>, a2_via_scan: bool) {
     let images = AtomicU64::new(0);
     let mut config = Config {
         cases: cases_budget(),
@@ -515,7 +541,7 @@ fn run_crash_suite(name: &str, strategy: impl Strategy<Value = CrashCase>) {
     };
     config.failure_persistence = None;
     let mut runner = TestRunner::new(config);
-    let result = runner.run(&strategy, |case| run_case(&case, &images));
+    let result = runner.run(&strategy, |case| run_case(&case, &images, a2_via_scan));
     println!(
         "{name}: crash images evaluated: {}",
         images.load(Ordering::Relaxed)
@@ -527,17 +553,17 @@ fn run_crash_suite(name: &str, strategy: impl Strategy<Value = CrashCase>) {
 
 #[test]
 fn crash_random_workloads() {
-    run_crash_suite("crash_random_workloads", crash_case(random_body()));
+    run_crash_suite("crash_random_workloads", crash_case(random_body()), false);
 }
 
 #[test]
 fn crash_ascending_keys() {
-    run_crash_suite("crash_ascending_keys", crash_case(ascending_body()));
+    run_crash_suite("crash_ascending_keys", crash_case(ascending_body()), false);
 }
 
 #[test]
 fn crash_overwrite_heavy() {
-    run_crash_suite("crash_overwrite_heavy", crash_case(overwrite_body()));
+    run_crash_suite("crash_overwrite_heavy", crash_case(overwrite_body()), false);
 }
 
 #[test]
@@ -548,12 +574,29 @@ fn crash_delete_heavy() {
             3 => delete_heavy_body(),
             1 => delete_all_body(),
         ]),
+        false,
+    );
+}
+
+/// A2 verified by a full-domain SCAN as the recovered engine's first
+/// operation (M2.2): recovery must yield a scannable tree, not merely a
+/// gettable one. The delete-heavy mix keeps reclamation in the picture.
+#[test]
+fn crash_scan_first_recovery() {
+    run_crash_suite(
+        "crash_scan_first_recovery",
+        crash_case(prop_oneof![
+            2 => delete_heavy_body(),
+            1 => delete_all_body(),
+            1 => upsert_heavy_body(),
+        ]),
+        true,
     );
 }
 
 #[test]
 fn crash_upsert_heavy() {
-    run_crash_suite("crash_upsert_heavy", crash_case(upsert_heavy_body()));
+    run_crash_suite("crash_upsert_heavy", crash_case(upsert_heavy_body()), false);
 }
 
 // ---------------------------------------------------------------------
@@ -671,6 +714,7 @@ fn run_sync_fail_case(case: &SyncFailCase, images: &AtomicU64) -> Result<(), Tes
         keys: &keys,
         live_ops: &case.live_ops,
         images,
+        a2_via_scan: false,
     };
     let end = h.log_len();
     for fates in &case.img_fates {

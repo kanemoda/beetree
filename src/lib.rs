@@ -25,7 +25,7 @@ pub mod vfs;
 
 pub use betree::BeTree;
 pub use disk::{CommitStats, DiskEngine, DiskError};
-pub use engine::KvEngine;
+pub use engine::{EngineError, KvEngine};
 pub use naive::NaiveEngine;
 pub use trace::{OpKind, OpKind2, TraceEvent, TraceEvent2, from_jsonl, replay, replay2, to_jsonl};
 pub use types::{CapacityKind, InvariantViolation, Key, Message, Params, UpsertOp, Value};

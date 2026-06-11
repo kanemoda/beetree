@@ -133,3 +133,14 @@ their kills probabilistic or impossible:
    usually survive. Canonical danger point (c) therefore tears the
    superblock write at every 4-byte field boundary (0..=72, plus padding
    and near-crc points), making the splice deterministic.
+
+## Deferred decisions
+
+- **v1 trace retirement + harness re-baseline** (recorded M2.2): the v1
+  trace view (`trace()`, `TraceEvent`/`OpKind`, `replay`) survives only
+  to keep `tests/harness.rs` byte-frozen (ADR-0013); as of M2.2 the v2
+  vocabulary is canonical (SPEC, "Public API additions (M2.1)"). Retiring
+  the v1 surface requires ONE documented re-baseline of the frozen
+  harness — new file, new hash, recorded rationale — and is deferred to a
+  polish milestone so it can ride along with any other accumulated
+  freeze-debt in a single, auditable break.
