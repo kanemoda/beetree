@@ -42,6 +42,14 @@ impl KvEngine for TempDiskEngine {
         self.engine.insert(key, value);
     }
 
+    fn delete(&mut self, key: Key) {
+        self.engine.delete(key);
+    }
+
+    fn upsert(&mut self, key: Key, op: beetree::UpsertOp) {
+        self.engine.upsert(key, op);
+    }
+
     fn get(&mut self, key: &[u8]) -> Option<Value> {
         self.engine.get(key)
     }
@@ -52,6 +60,10 @@ impl KvEngine for TempDiskEngine {
 
     fn trace(&self) -> &[beetree::TraceEvent] {
         self.engine.trace()
+    }
+
+    fn trace2(&self) -> &[beetree::TraceEvent2] {
+        self.engine.trace2()
     }
 }
 
@@ -485,6 +497,41 @@ fn create_and_open_reject_bad_files() {
         DiskEngine::open(&garbage).expect_err("garbage has no valid superblock"),
         DiskError::NoValidSuperblock
     ));
+}
+
+/// Reclamation round trip (M2.1): build a real tree, delete everything,
+/// commit — the committed state is the empty tree (every key reads None
+/// after reopen), and the file remains a live base for new work.
+#[test]
+fn delete_all_commits_an_empty_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db_path(&dir);
+    let mut engine = DiskEngine::create(&path, Params::default()).unwrap();
+    for b in 0..=255u8 {
+        engine.insert(vec![b], vec![b]);
+    }
+    engine.commit().unwrap();
+    for b in 0..=255u8 {
+        engine.delete(vec![b]);
+    }
+    engine.check_invariants().unwrap();
+    engine.commit().unwrap();
+    drop(engine);
+
+    let mut engine = DiskEngine::open(&path).unwrap();
+    for b in 0..=255u8 {
+        assert_eq!(engine.get(&[b]), None, "key {b} must be gone");
+    }
+    engine.load_all().unwrap();
+    engine.check_invariants().unwrap();
+    // The emptied tree accepts new work across another session.
+    engine.insert(vec![42], b"reborn".to_vec());
+    engine.upsert(vec![43, 43], beetree::UpsertOp::Add(5));
+    engine.commit().unwrap();
+    drop(engine);
+    let mut engine = DiskEngine::open(&path).unwrap();
+    assert_eq!(engine.get(&[42]), Some(b"reborn".to_vec()));
+    assert_eq!(engine.get(&[43, 43]), Some(5i64.to_le_bytes().to_vec()));
 }
 
 /// Seqnos continue across reopen (the superblock's `last_seq`): the first

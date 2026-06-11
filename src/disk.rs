@@ -2,10 +2,10 @@
 //! file, dual-superblock atomic commits, recovery — and no write-ahead log
 //! by design (ADR-0007).
 //!
-//! Between commits, [`DiskEngine`] is the M0.2 in-memory engine: the same
-//! greedy-fullest flush policy, the same splits-via-return-values cascade
+//! Between commits, [`DiskEngine`] is the in-memory engine: the same
+//! greedy-fullest flush policy, message algebra, and reclamation
 //! (deliberately mirrored from `src/betree.rs`, slot bookkeeping aside),
-//! the same P1–P5 semantics under the frozen harness. `commit()` makes the
+//! the same P1–P5/Q1–Q5 semantics under the harnesses. `commit()` makes the
 //! current state durable by appending every dirty node to the data region
 //! (children before parents), syncing, then publishing the new root through
 //! the inactive superblock slot (ADR-0008). `open()` resumes from the
@@ -25,11 +25,14 @@ use crate::check::{self, NodeSource};
 use crate::engine::KvEngine;
 use crate::format::{
     DATA_START, DiskNode, FORMAT_VERSION, MAGIC, RECORD_HEADER_SIZE, SUPERBLOCK_SLOT_SIZE,
-    SUPERBLOCK_SLOTS, Superblock, decode_node, encode_node,
+    SUPERBLOCK_SLOTS, SlotStatus, Superblock, decode_node, encode_node,
 };
-use crate::node::{LeafEntry, Node, NodeId, partition_sizes, route};
-use crate::trace::{OpKind, TraceEvent};
-use crate::types::{InvariantViolation, Key, Message, Params, Value};
+use crate::node::{
+    Delivery, LeafEntry, Node, NodeId, Outcome, apply_chain, apply_to_leaf, coalesce_into,
+    partition_sizes, route,
+};
+use crate::trace::{OpKind2, Recorder, TraceEvent, TraceEvent2};
+use crate::types::{InvariantViolation, Key, Message, Params, UpsertOp, Value};
 use crate::vfs::Vfs;
 
 /// A storage-layer failure: real I/O errors, detected corruption, or a
@@ -58,6 +61,14 @@ pub enum DiskError {
     /// database this build can open.
     #[error("no valid superblock in either slot")]
     NoValidSuperblock,
+
+    /// The file is a real database, but of a different on-disk format
+    /// version. There is no migration pre-release (ADR-0012).
+    #[error("unsupported on-disk format version {found} (this build reads v{FORMAT_VERSION})")]
+    UnsupportedVersion {
+        /// The format version found in the file's superblock.
+        found: u32,
+    },
 
     /// `create()` refuses to clobber an existing non-empty file.
     #[error("refusing to create a database over {len} bytes of existing data")]
@@ -153,7 +164,7 @@ pub struct DiskEngine<V: Vfs> {
     /// Set when a storage error interrupts a mutation or a commit; from
     /// then on `commit()` refuses with [`DiskError::Poisoned`].
     poisoned: bool,
-    trace: Vec<TraceEvent>,
+    trace: Recorder,
 }
 
 /// Summarized by hand: the slot arena is far too large to dump, and the
@@ -222,7 +233,7 @@ impl<V: Vfs> DiskEngine<V> {
             next_generation: 0,
             watermark: DATA_START,
             poisoned: false,
-            trace: Vec::new(),
+            trace: Recorder::default(),
         };
         engine.commit()?;
         Ok(engine)
@@ -232,22 +243,40 @@ impl<V: Vfs> DiskEngine<V> {
     pub fn open_on(mut vfs: V) -> Result<Self, DiskError> {
         let file_len = vfs.len()?;
         let mut best: Option<Superblock> = None;
+        let mut wrong_version: Option<u32> = None;
         for &slot_offset in &SUPERBLOCK_SLOTS {
             if file_len < slot_offset + SUPERBLOCK_SLOT_SIZE {
                 continue;
             }
             let mut slot = vec![0u8; SUPERBLOCK_SLOT_SIZE as usize];
             vfs.read_exact_at(slot_offset, &mut slot)?;
-            if let Some(sb) = Superblock::decode_slot(&slot) {
-                // Data is synced before the superblock that points at it,
-                // so an honest slot can never claim more bytes than the
-                // file holds. One that does (external truncation, crafted
-                // bytes) is invalid — picking it would make the set_len
-                // below zero-EXTEND the file instead of dropping a tail.
-                if sb.watermark <= file_len && best.is_none_or(|b| sb.generation > b.generation) {
-                    best = Some(sb);
+            match Superblock::decode_slot(&slot) {
+                SlotStatus::Valid(sb) => {
+                    // Data is synced before the superblock that points at
+                    // it, so an honest slot can never claim more bytes
+                    // than the file holds. One that does (external
+                    // truncation, crafted bytes) is invalid — picking it
+                    // would make the set_len below zero-EXTEND the file
+                    // instead of dropping a tail.
+                    if sb.watermark <= file_len && best.is_none_or(|b| sb.generation > b.generation)
+                    {
+                        best = Some(sb);
+                    }
                 }
+                SlotStatus::WrongVersion(found) => wrong_version = Some(found),
+                SlotStatus::Invalid => {}
             }
+        }
+        // The version gate is UNCONDITIONAL: an authenticated
+        // other-version slot refuses the whole file even when the other
+        // slot holds a valid v2 superblock (ADR-0012). Opening the v2
+        // slot instead would silently roll back to a stale generation —
+        // and the next commit would overwrite the newer foreign
+        // superblock. A torn v2 write can never authenticate as a foreign
+        // version (the full-slot crc must check first), so refusing here
+        // has no false positives.
+        if let Some(found) = wrong_version {
+            return Err(DiskError::UnsupportedVersion { found });
         }
         let sb = best.ok_or(DiskError::NoValidSuperblock)?;
         // Drop any torn tail beyond the committed watermark: those bytes
@@ -264,7 +293,7 @@ impl<V: Vfs> DiskEngine<V> {
             next_generation: sb.generation + 1,
             watermark: sb.watermark,
             poisoned: false,
-            trace: Vec::new(),
+            trace: Recorder::default(),
         })
     }
 
@@ -403,29 +432,50 @@ impl<V: Vfs> DiskEngine<V> {
         self.ensure_loaded(self.root)?;
         self.next_seq += 1;
         let seq = self.next_seq;
-        self.trace.push(TraceEvent::Op {
+        self.trace.op(
             seq,
-            op: OpKind::Insert {
+            OpKind2::Insert {
                 key: key.clone(),
                 value: value.clone(),
             },
-        });
+        );
+        self.apply_root(key, Message::Put { seq, value })
+    }
+
+    /// Remove a key, reporting storage failures instead of panicking; the
+    /// same error/poisoning semantics as [`DiskEngine::try_insert`].
+    pub fn try_delete(&mut self, key: Key) -> Result<(), DiskError> {
+        self.ensure_loaded(self.root)?;
+        self.next_seq += 1;
+        let seq = self.next_seq;
+        self.trace.op(seq, OpKind2::Delete { key: key.clone() });
+        self.apply_root(key, Message::Delete { seq })
+    }
+
+    /// Blindly transform a value, reporting storage failures instead of
+    /// panicking; the same error/poisoning semantics as
+    /// [`DiskEngine::try_insert`].
+    pub fn try_upsert(&mut self, key: Key, op: UpsertOp) -> Result<(), DiskError> {
+        self.ensure_loaded(self.root)?;
+        self.next_seq += 1;
+        let seq = self.next_seq;
+        self.trace.op(
+            seq,
+            OpKind2::Upsert {
+                key: key.clone(),
+                op,
+            },
+        );
+        self.apply_root(key, Message::Upsert { seq, op })
+    }
+
+    /// The shared tail of every public mutating op: route the message at
+    /// the (already loaded) root and re-settle the tree, poisoning the
+    /// engine if the cascade errors mid-mutation.
+    fn apply_root(&mut self, key: Key, message: Message) -> Result<(), DiskError> {
         match self.loaded_mut(self.root) {
-            Node::Leaf { entries } => {
-                let old = entries.insert(key, LeafEntry { seq, value });
-                debug_assert!(
-                    old.is_none_or(|e| e.seq < seq),
-                    "seqnos are monotonic, so a replaced root-leaf entry must be older"
-                );
-            }
-            Node::Internal { buffer, .. } => {
-                // Coalesce into the root buffer (ADR-0003): newest wins.
-                let old = buffer.insert(key, Message::Put { seq, value });
-                debug_assert!(
-                    old.is_none_or(|m| m.seq() < seq),
-                    "seqnos are monotonic, so a coalesced-away message must be older"
-                );
-            }
+            Node::Leaf { entries } => apply_to_leaf(entries, key, message),
+            Node::Internal { buffer, .. } => coalesce_into(buffer, key, message),
         }
         let result = self.restore_root();
         if result.is_err() {
@@ -438,7 +488,12 @@ impl<V: Vfs> DiskEngine<V> {
     /// detected corruption — instead of panicking. Never wrong data: a
     /// record that fails validation is an error, not an answer.
     pub fn try_get(&mut self, key: &[u8]) -> Result<Option<Value>, DiskError> {
-        self.trace.push(TraceEvent::Get { key: key.to_vec() });
+        self.trace.get(key);
+        // Walk root→leaf accumulating the pending-upsert chain (SPEC,
+        // "Reads"): by I3 every occurrence above is newer, so a Put or
+        // Delete terminates the walk (everything below is shadowed) while
+        // upserts stack — a running wrapping sum suffices for Add.
+        let mut chain: Option<i64> = None;
         let mut id = self.root;
         loop {
             self.ensure_loaded(id)?;
@@ -448,15 +503,27 @@ impl<V: Vfs> DiskEngine<V> {
                     children,
                     buffer,
                 } => {
-                    // A buffer hit can be returned immediately: by I3
-                    // (freshness order), the topmost occurrence of a key on
-                    // the root→leaf path is the newest.
-                    if let Some(Message::Put { value, .. }) = buffer.get(key) {
-                        return Ok(Some(value.clone()));
+                    match buffer.get(key) {
+                        Some(Message::Put { value, .. }) => {
+                            return Ok(apply_chain(chain, Some(value)));
+                        }
+                        Some(Message::Delete { .. }) => return Ok(apply_chain(chain, None)),
+                        Some(Message::Upsert {
+                            op: UpsertOp::Add(delta),
+                            ..
+                        }) => {
+                            chain = Some(chain.unwrap_or(0).wrapping_add(*delta));
+                        }
+                        None => {}
                     }
                     id = children[route(pivots, key)];
                 }
-                Node::Leaf { entries } => return Ok(entries.get(key).map(|e| e.value.clone())),
+                Node::Leaf { entries } => {
+                    return Ok(apply_chain(
+                        chain,
+                        entries.get(key).map(|e| e.value.as_slice()),
+                    ));
+                }
             }
         }
     }
@@ -675,20 +742,35 @@ impl<V: Vfs> DiskEngine<V> {
     // deliberately — the in-memory semantics between commits are normative
     // and identical; only residency and dirty tracking differ.
 
-    /// Re-establish capacity invariants at the root after an insert,
-    /// growing the tree upward as needed. Every promoted piece sits at the
-    /// same depth as the old root, so a new root above them keeps all
-    /// leaves at uniform depth (I6).
+    /// Re-establish capacity invariants at the root after a public
+    /// mutating op, growing the tree upward (splits) or shrinking it
+    /// (reclamation; SPEC "Reclamation v1") as needed. Every promoted
+    /// piece sits at the same depth as the old root, so a new root above
+    /// them keeps all leaves at uniform depth (I6).
     fn restore_root(&mut self) -> Result<(), DiskError> {
         loop {
             let root_is_internal = matches!(self.loaded(self.root), Node::Internal { .. });
-            let promoted = if root_is_internal {
+            let outcome = if root_is_internal {
                 self.flush_overfull(self.root)?
             } else {
-                self.split_if_needed(self.root)
+                Outcome::Splits(self.split_if_needed(self.root))
+            };
+            let promoted = match outcome {
+                Outcome::Removed => {
+                    // Every key range beneath the root emptied out: the
+                    // tree is the empty tree again — its initial state, a
+                    // single (dirty) empty leaf. The old root's slot
+                    // leaks, and its records go unreferenced by the next
+                    // commit — CoW handles reclamation on disk.
+                    self.root = self.alloc_dirty(Node::Leaf {
+                        entries: BTreeMap::new(),
+                    });
+                    break;
+                }
+                Outcome::Splits(promoted) => promoted,
             };
             if promoted.is_empty() {
-                return Ok(());
+                break;
             }
             let mut pivots = Vec::with_capacity(promoted.len());
             let mut children = Vec::with_capacity(promoted.len() + 1);
@@ -706,17 +788,36 @@ impl<V: Vfs> DiskEngine<V> {
             // into many pieces under tiny L); the next iteration splits it
             // again, growing the height by one more level.
         }
+        // Root collapse (SPEC "Reclamation v1"): promote a lone child
+        // while the root's buffer is empty. A non-empty buffer is NOT
+        // force-flushed — a stale tall root is harmless and collapses on
+        // a later op once its buffer drains. The promoted child needs no
+        // load: it stays a NodeId either way, and the next commit's
+        // superblock simply points at it (a clean child keeps its record;
+        // the abandoned root chain leaks by design).
+        loop {
+            match self.loaded(self.root) {
+                Node::Internal {
+                    children, buffer, ..
+                } if children.len() == 1 && buffer.is_empty() => {
+                    self.root = children[0];
+                    self.ensure_loaded(self.root)?;
+                }
+                _ => break,
+            }
+        }
+        Ok(())
     }
 
     /// Flush this internal node's buffer until it holds ≤ B messages, then
-    /// split the node itself if its fanout overflowed. Returns the promoted
-    /// (pivot, new-right-sibling) pairs the caller must integrate
-    /// (ADR-0005). Errors only on storage failure while loading a flush
-    /// target.
+    /// settle the node itself: split it if its fanout overflowed, or
+    /// signal [`Outcome::Removed`] if deliveries emptied every child out
+    /// from under it (ADR-0005; SPEC "Reclamation v1"). Errors only on
+    /// storage failure while loading a flush target.
     ///
     /// Explicit frame stack, NOT machine recursion, exactly as in
     /// `src/betree.rs`: degenerate F=2 trees are linearly tall.
-    fn flush_overfull(&mut self, id: NodeId) -> Result<Vec<(Key, NodeId)>, DiskError> {
+    fn flush_overfull(&mut self, id: NodeId) -> Result<Outcome, DiskError> {
         // Nodes currently flushing, cascade root first. A node below the
         // top of the stack is waiting for its overfull child above it.
         let mut flushing: Vec<NodeId> = vec![id];
@@ -725,34 +826,88 @@ impl<V: Vfs> DiskEngine<V> {
                 .last()
                 .expect("the flush stack only empties via the return below");
             if self.buffer_len(top) <= self.params.buffer_capacity {
-                // `top` is done: split it if its fanout overflowed and hand
-                // the promoted pairs to the frame below (its parent in the
-                // cascade), or to the caller for the cascade root.
-                let promoted = self.split_if_needed(top);
+                // `top` is done: hand its outcome to the frame below (its
+                // parent in the cascade), or to the caller for the
+                // cascade root.
+                let outcome = self.settle(top);
                 flushing.pop();
                 match flushing.last() {
-                    Some(&parent) => self.integrate_splits(parent, promoted),
-                    None => return Ok(promoted),
+                    Some(&parent) => match outcome {
+                        Outcome::Splits(promoted) => self.integrate_splits(parent, promoted),
+                        Outcome::Removed => self.remove_child(parent, top),
+                    },
+                    None => return Ok(outcome),
                 }
                 continue;
             }
             let (chosen, child_id, child_occupancies, batch) = self.pick_and_extract(top);
-            self.trace.push(TraceEvent::FlushDecision {
-                node: top,
-                child_occupancies,
-                chosen,
-            });
-            if self.apply_batch(child_id, batch)? {
-                // The child's buffer now overflows too: flush it to
-                // completion before continuing with `top`.
-                flushing.push(child_id);
-            } else {
-                // Integrate split pieces immediately: child indices shift,
-                // so the next iteration recomputes routing from scratch
-                // rather than caching it across iterations.
-                let promoted = self.split_if_needed(child_id);
-                self.integrate_splits(top, promoted);
+            self.trace.flush_decision(top, child_occupancies, chosen);
+            match self.apply_batch(child_id, batch)? {
+                Delivery::Internal { overflowed: true } => {
+                    // The child's buffer now overflows too: flush it to
+                    // completion before continuing with `top`.
+                    flushing.push(child_id);
+                }
+                Delivery::Internal { overflowed: false } | Delivery::Leaf { emptied: false } => {
+                    // Integrate split pieces immediately: child indices
+                    // shift, so the next iteration recomputes routing from
+                    // scratch rather than caching it across iterations.
+                    let promoted = self.split_if_needed(child_id);
+                    self.integrate_splits(top, promoted);
+                }
+                Delivery::Leaf { emptied: true } => {
+                    // The delivery annihilated the leaf's last entries:
+                    // reclaim it right now (I7) — a delivery cannot both
+                    // split and empty.
+                    self.remove_child(top, child_id);
+                }
             }
+        }
+    }
+
+    /// A flushed node's parting word to its parent: [`Outcome::Removed`]
+    /// for an internal node whose children were all reclaimed (its buffer
+    /// is necessarily empty: the messages went down with the deliveries
+    /// that emptied them), else its split pieces.
+    fn settle(&mut self, id: NodeId) -> Outcome {
+        if let Node::Internal {
+            children, buffer, ..
+        } = self.loaded(id)
+        {
+            if children.is_empty() {
+                debug_assert!(
+                    buffer.is_empty(),
+                    "a node that lost every child has delivered every message"
+                );
+                return Outcome::Removed;
+            }
+        }
+        Outcome::Splits(self.split_if_needed(id))
+    }
+
+    /// Unlink a reclaimed child (SPEC "Reclamation v1"): drop it and its
+    /// adjacent pivot — the left pivot if one exists, else the right one —
+    /// so the neighbor absorbs the emptied key range. A parent reduced to
+    /// a single child PERSISTS (fanout-1 internals are legal; same
+    /// degeneracy class as F=2); one reduced to zero children signals
+    /// [`Outcome::Removed`] when it settles. The reclaimed child's slot
+    /// leaks, and its records go unreferenced by the next commit.
+    fn remove_child(&mut self, parent: NodeId, child: NodeId) {
+        let Node::Internal {
+            pivots, children, ..
+        } = self.loaded_mut(parent)
+        else {
+            unreachable!("children are only ever removed from internal nodes")
+        };
+        let at = children
+            .iter()
+            .position(|&c| c == child)
+            .expect("the removed node is a child of this parent");
+        children.remove(at);
+        if at > 0 {
+            pivots.remove(at - 1);
+        } else if !pivots.is_empty() {
+            pivots.remove(0);
         }
     }
 
@@ -801,39 +956,33 @@ impl<V: Vfs> DiskEngine<V> {
         (chosen, children[chosen], occupancies, batch)
     }
 
-    /// Apply a flushed batch to `child_id` (leaf: materialize entries;
-    /// internal: coalesce into the buffer), loading the child first if it
-    /// is still on disk. Returns true iff the child is internal and its
-    /// buffer now exceeds B, i.e. it must flush next.
+    /// Apply a flushed batch to `child_id` (leaf: materialize entries per
+    /// the message kinds — tombstones annihilate; internal: coalesce into
+    /// the buffer per the normative table), loading the child first if it
+    /// is still on disk, and report what the delivery did.
     fn apply_batch(
         &mut self,
         child_id: NodeId,
         batch: BTreeMap<Key, Message>,
-    ) -> Result<bool, DiskError> {
+    ) -> Result<Delivery, DiskError> {
         self.ensure_loaded(child_id)?;
         let buffer_capacity = self.params.buffer_capacity;
         Ok(match self.loaded_mut(child_id) {
             Node::Leaf { entries } => {
                 for (key, message) in batch {
-                    let Message::Put { seq, value } = message;
-                    let old = entries.insert(key, LeafEntry { seq, value });
-                    debug_assert!(
-                        old.is_none_or(|e| e.seq < seq),
-                        "I3: an incoming message must be newer than the leaf entry it replaces"
-                    );
+                    apply_to_leaf(entries, key, message);
                 }
-                false
+                Delivery::Leaf {
+                    emptied: entries.is_empty(),
+                }
             }
             Node::Internal { buffer, .. } => {
                 for (key, message) in batch {
-                    let seq = message.seq();
-                    let old = buffer.insert(key, message);
-                    debug_assert!(
-                        old.is_none_or(|m| m.seq() < seq),
-                        "I3: an incoming message must be newer than the buffered one it coalesces"
-                    );
+                    coalesce_into(buffer, key, message);
                 }
-                buffer.len() > buffer_capacity
+                Delivery::Internal {
+                    overflowed: buffer.len() > buffer_capacity,
+                }
             }
         })
     }
@@ -1013,6 +1162,16 @@ impl<V: Vfs> KvEngine for DiskEngine<V> {
             .expect("storage failure during insert (use try_insert to handle it)")
     }
 
+    fn delete(&mut self, key: Key) {
+        self.try_delete(key)
+            .expect("storage failure during delete (use try_delete to handle it)")
+    }
+
+    fn upsert(&mut self, key: Key, op: UpsertOp) {
+        self.try_upsert(key, op)
+            .expect("storage failure during upsert (use try_upsert to handle it)")
+    }
+
     fn get(&mut self, key: &[u8]) -> Option<Value> {
         self.try_get(key)
             .expect("storage failure during get (use try_get to handle it)")
@@ -1028,13 +1187,80 @@ impl<V: Vfs> KvEngine for DiskEngine<V> {
     }
 
     fn trace(&self) -> &[TraceEvent] {
-        &self.trace
+        self.trace.v1()
+    }
+
+    fn trace2(&self) -> &[TraceEvent2] {
+        self.trace.v2()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The version gate is UNCONDITIONAL (SPEC "On-disk format"): a file
+    /// carrying an authenticated foreign-version slot is refused even when
+    /// its other slot holds a valid v2 superblock. Opening the stale v2
+    /// generation instead would silently roll back — and the next commit
+    /// would overwrite the newer foreign superblock (the
+    /// downgrade-then-upgrade hazard found by the M2.1 review).
+    #[test]
+    fn mixed_version_slots_refuse_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.db");
+        // A real v2 database in slot 0 (generation 0 from create()).
+        drop(DiskEngine::create(&path, Params::default()).unwrap());
+        // A crafted, authenticated v1 superblock in slot 1, claiming a
+        // NEWER generation.
+        let foreign = Superblock {
+            magic: MAGIC,
+            format_version: 1,
+            params: Params::default(),
+            last_seq: 9,
+            generation: 1,
+            root_offset: DATA_START,
+            watermark: DATA_START + 64,
+        };
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[SUPERBLOCK_SLOT_SIZE as usize..2 * SUPERBLOCK_SLOT_SIZE as usize]
+            .copy_from_slice(&foreign.encode_slot().unwrap());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = DiskEngine::open(&path).expect_err("mixed versions must refuse");
+        assert!(
+            matches!(err, DiskError::UnsupportedVersion { found: 1 }),
+            "got {err:?}"
+        );
+    }
+
+    /// A crafted v1 superblock — authenticated but of the previous format
+    /// version — must be refused with exactly `UnsupportedVersion`, not
+    /// `NoValidSuperblock`: the file IS a database, just not one this
+    /// build reads (ADR-0012; no migration pre-release).
+    #[test]
+    fn v1_superblock_is_rejected_as_unsupported_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        let sb = Superblock {
+            magic: MAGIC,
+            format_version: 1,
+            params: Params::default(),
+            last_seq: 7,
+            generation: 0,
+            root_offset: DATA_START,
+            watermark: DATA_START + 64,
+        };
+        let mut file = sb.encode_slot().unwrap();
+        file.resize((DATA_START + 64) as usize, 0);
+        std::fs::write(&path, &file).unwrap();
+
+        let err = DiskEngine::open(&path).expect_err("v1 must be refused");
+        assert!(
+            matches!(err, DiskError::UnsupportedVersion { found: 1 }),
+            "got {err:?}"
+        );
+    }
 
     /// A record can pass its CRC and still be malformed (a crafted file,
     /// or the one-in-2^32 checksum collision). An internal node whose

@@ -33,8 +33,10 @@ pub(crate) const RECORD_HEADER_SIZE: u64 = 8;
 /// Magic bytes opening every superblock.
 pub(crate) const MAGIC: [u8; 4] = *b"BEET";
 
-/// On-disk format version this build reads and writes.
-pub(crate) const FORMAT_VERSION: u32 = 1;
+/// On-disk format version this build reads and writes. v2 (M2.1) changed
+/// the `Message` encoding (delete and upsert variants); v1 files are
+/// rejected with a typed error — no migration pre-release (ADR-0012).
+pub(crate) const FORMAT_VERSION: u32 = 2;
 
 /// The bincode configuration every on-disk byte goes through:
 /// little-endian, fixed-width integers (usize as u64).
@@ -83,20 +85,32 @@ impl Superblock {
         Ok(slot)
     }
 
-    /// Parse a 4096-byte slot image; `None` if the slot is not a valid
-    /// superblock (bad crc, magic, version, or insane geometry) — open()
-    /// then falls back to the other slot.
-    pub fn decode_slot(slot: &[u8]) -> Option<Superblock> {
+    /// Parse a 4096-byte slot image. A slot that authenticates (crc and
+    /// magic check) but carries a different format version is reported as
+    /// [`SlotStatus::WrongVersion`] so `open()` can refuse the FILE with a
+    /// typed error instead of misreading "old database" as "no database"
+    /// (ADR-0012); anything else that fails validation is
+    /// [`SlotStatus::Invalid`] and `open()` falls back to the other slot.
+    pub fn decode_slot(slot: &[u8]) -> SlotStatus {
         if slot.len() != SUPERBLOCK_SLOT_SIZE as usize {
-            return None;
+            return SlotStatus::Invalid;
         }
         let crc_at = slot.len() - 4;
         let stored = u32::from_le_bytes(slot[crc_at..].try_into().expect("4 bytes"));
         if crc32fast::hash(&slot[..crc_at]) != stored {
-            return None;
+            return SlotStatus::Invalid;
         }
-        let (sb, _): (Superblock, usize) =
-            bincode::serde::decode_from_slice(&slot[..crc_at], config()).ok()?;
+        let Ok((sb, _)) =
+            bincode::serde::decode_from_slice::<Superblock, _>(&slot[..crc_at], config())
+        else {
+            return SlotStatus::Invalid;
+        };
+        if sb.magic != MAGIC {
+            return SlotStatus::Invalid;
+        }
+        if sb.format_version != FORMAT_VERSION {
+            return SlotStatus::WrongVersion(sb.format_version);
+        }
         // Conjunct order matters: `watermark >= DATA_START` first makes
         // the subtraction below safe, and comparing instead of adding to
         // `root_offset` keeps offsets near u64::MAX from wrapping a check
@@ -106,9 +120,25 @@ impl Superblock {
             && sb.root_offset <= sb.watermark - RECORD_HEADER_SIZE;
         let params_ok =
             sb.params.fanout >= 2 && sb.params.buffer_capacity >= 1 && sb.params.leaf_capacity >= 1;
-        (sb.magic == MAGIC && sb.format_version == FORMAT_VERSION && geometry_ok && params_ok)
-            .then_some(sb)
+        if geometry_ok && params_ok {
+            SlotStatus::Valid(sb)
+        } else {
+            SlotStatus::Invalid
+        }
     }
+}
+
+/// What [`Superblock::decode_slot`] made of a slot image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotStatus {
+    /// A valid superblock of the current format version.
+    Valid(Superblock),
+    /// An authenticated superblock (crc + magic check) of a DIFFERENT
+    /// format version: the file is a real database this build refuses to
+    /// open (ADR-0012).
+    WrongVersion(u32),
+    /// Not a usable superblock (corrupt, torn, garbage, or insane).
+    Invalid,
 }
 
 /// A node as it lies in a record: identical to the in-memory
@@ -167,12 +197,25 @@ mod tests {
         }
     }
 
+    /// An authenticated slot of another version is distinguishable from
+    /// garbage: open() must refuse the file, not fall through to
+    /// NoValidSuperblock (ADR-0012).
+    #[test]
+    fn wrong_version_is_reported_not_swallowed() {
+        let mut sb = superblock();
+        sb.format_version = 1;
+        assert_eq!(
+            Superblock::decode_slot(&sb.encode_slot().unwrap()),
+            SlotStatus::WrongVersion(1)
+        );
+    }
+
     #[test]
     fn superblock_slot_round_trips() {
         let sb = superblock();
         let slot = sb.encode_slot().unwrap();
         assert_eq!(slot.len() as u64, SUPERBLOCK_SLOT_SIZE);
-        assert_eq!(Superblock::decode_slot(&slot), Some(sb));
+        assert_eq!(Superblock::decode_slot(&slot), SlotStatus::Valid(sb));
     }
 
     /// Geometry validation must hold at the u64 boundary: a CRC-valid slot
@@ -184,12 +227,18 @@ mod tests {
         let mut sb = superblock();
         sb.root_offset = u64::MAX;
         sb.watermark = u64::MAX;
-        assert_eq!(Superblock::decode_slot(&sb.encode_slot().unwrap()), None);
+        assert_eq!(
+            Superblock::decode_slot(&sb.encode_slot().unwrap()),
+            SlotStatus::Invalid
+        );
 
         let mut sb = superblock();
         sb.root_offset = u64::MAX - 4; // the sum wraps to a tiny value
         sb.watermark = DATA_START + 99;
-        assert_eq!(Superblock::decode_slot(&sb.encode_slot().unwrap()), None);
+        assert_eq!(
+            Superblock::decode_slot(&sb.encode_slot().unwrap()),
+            SlotStatus::Invalid
+        );
     }
 
     #[test]
@@ -199,7 +248,11 @@ mod tests {
         for &at in &[0usize, 5, 40, 2048, 4091, 4092, 4095] {
             let mut bad = slot.clone();
             bad[at] ^= 0x01;
-            assert_eq!(Superblock::decode_slot(&bad), None, "flip at {at}");
+            assert_eq!(
+                Superblock::decode_slot(&bad),
+                SlotStatus::Invalid,
+                "flip at {at}"
+            );
         }
     }
 

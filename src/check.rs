@@ -1,4 +1,4 @@
-//! The invariant checker (I1–I6, `docs/SPEC.md`), shared by every tree
+//! The invariant checker (I1–I7, `docs/SPEC.md`), shared by every tree
 //! engine.
 //!
 //! The walk is generic over [`NodeSource`] so `BeTree` (M0.2) and
@@ -33,7 +33,7 @@ fn in_range(key: &[u8], lower: Option<&[u8]>, upper: Option<&[u8]>) -> bool {
     lower.is_none_or(|lo| key >= lo) && upper.is_none_or(|hi| key < hi)
 }
 
-/// Walk the whole tree and verify invariants I1–I6 (`docs/SPEC.md`).
+/// Walk the whole tree and verify invariants I1–I7 (`docs/SPEC.md`).
 pub(crate) fn check_invariants(src: &impl NodeSource) -> Result<(), InvariantViolation> {
     let mut depths = LeafDepths {
         shallowest: usize::MAX,
@@ -125,6 +125,12 @@ fn check_tree(src: &impl NodeSource, depths: &mut LeafDepths) -> Result<(), Inva
                         occupancy: entries.len(),
                         limit: params.leaf_capacity,
                     });
+                }
+                // I7: an emptied leaf must have been reclaimed by its
+                // parent before the public op returned (SPEC,
+                // "Reclamation v1"); only the root may be empty.
+                if entries.is_empty() && id != src.root() {
+                    return Err(InvariantViolation::EmptyNonRootLeaf { node: id });
                 }
                 for (key, entry) in entries {
                     if !in_range(key, lower, upper) {

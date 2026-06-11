@@ -19,15 +19,47 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use beetree::{DiskEngine, DiskError, Fate, FaultyVfs, Key, KvEngine, Params, Value, VfsOp};
+use beetree::{
+    DiskEngine, DiskError, Fate, FaultyVfs, Key, KvEngine, Params, UpsertOp, Value, VfsOp,
+};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 
-/// One step of a generated workload.
+/// One step of a generated workload (full M2.1 op mix).
 #[derive(Debug, Clone)]
 enum PlanOp {
     Ins(Key, Value),
+    Del(Key),
+    Ups(Key, i64),
     Commit,
+}
+
+/// Apply one non-commit plan op to engine, oracle, and the sweep domain.
+fn apply_plan_op(
+    engine: &mut DiskEngine<FaultyVfs>,
+    oracle: &mut BTreeMap<Key, Value>,
+    keys: &mut BTreeSet<Key>,
+    op: &PlanOp,
+) {
+    match op {
+        PlanOp::Ins(k, v) => {
+            keys.insert(k.clone());
+            engine.insert(k.clone(), v.clone());
+            oracle.insert(k.clone(), v.clone());
+        }
+        PlanOp::Del(k) => {
+            keys.insert(k.clone());
+            engine.delete(k.clone());
+            oracle.remove(k);
+        }
+        PlanOp::Ups(k, d) => {
+            keys.insert(k.clone());
+            engine.upsert(k.clone(), UpsertOp::Add(*d));
+            let value = UpsertOp::Add(*d).apply(oracle.get(k).map(|v| v.as_slice()));
+            oracle.insert(k.clone(), value);
+        }
+        PlanOp::Commit => unreachable!("commits are handled by the workload loop"),
+    }
 }
 
 /// Everything one crash case needs; all randomness lives here.
@@ -99,6 +131,67 @@ fn overwrite_body() -> impl Strategy<Value = Vec<PlanOp>> {
         prop_oneof![
             14 => (0usize..3, value_strategy())
                 .prop_map(|(k, v)| PlanOp::Ins(vec![[10u8, 128, 200][k]], v)),
+            1 => Just(PlanOp::Commit),
+        ],
+        50..=400,
+    )
+}
+
+/// Delete-heavy mixed workload (M2.1): tombstones dominate, so crash
+/// images land on shrinking trees, emptied leaves, and collapsed roots.
+fn delete_heavy_body() -> impl Strategy<Value = Vec<PlanOp>> {
+    proptest::collection::vec(
+        prop_oneof![
+            5 => (0u8..16, value_strategy()).prop_map(|(k, v)| PlanOp::Ins(vec![k], v)),
+            8 => (0u8..16).prop_map(|k| PlanOp::Del(vec![k])),
+            1 => (0u8..16, any::<i64>()).prop_map(|(k, d)| PlanOp::Ups(vec![k], d)),
+            1 => Just(PlanOp::Commit),
+        ],
+        50..=400,
+    )
+}
+
+/// Build the whole domain, then delete ALL of it, with commits at both
+/// shores: crash images of the emptied tree (and of the emptying itself)
+/// must recover like any other generation.
+fn delete_all_body() -> impl Strategy<Value = Vec<PlanOp>> {
+    (
+        proptest::collection::vec(value_strategy(), 12),
+        proptest::collection::vec(any::<i64>(), 3),
+    )
+        .prop_map(|(vals, deltas)| {
+            let mut ops = Vec::new();
+            for (i, v) in vals.into_iter().enumerate() {
+                ops.push(PlanOp::Ins(vec![i as u8], v));
+            }
+            for (i, d) in deltas.into_iter().enumerate() {
+                ops.push(PlanOp::Ups(vec![i as u8], d));
+            }
+            ops.push(PlanOp::Commit);
+            // Three delete passes: the first empties the domain
+            // semantically; resting tombstones move only on buffer
+            // overflow (SPEC "Reclamation v1", no force-flush), so the
+            // second and third drive them down until the committed state
+            // is the reclamation-produced empty root leaf — its crash
+            // images must recover like any other generation.
+            for _pass in 0..3 {
+                for i in 0..12u8 {
+                    ops.push(PlanOp::Del(vec![i]));
+                }
+                ops.push(PlanOp::Commit);
+            }
+            ops
+        })
+}
+
+/// Upsert-heavy mixed workload (M2.1): pending-upsert chains span levels,
+/// so recovery must reassemble them exactly.
+fn upsert_heavy_body() -> impl Strategy<Value = Vec<PlanOp>> {
+    proptest::collection::vec(
+        prop_oneof![
+            3 => (0u8..16, value_strategy()).prop_map(|(k, v)| PlanOp::Ins(vec![k], v)),
+            1 => (0u8..16).prop_map(|k| PlanOp::Del(vec![k])),
+            9 => (0u8..16, any::<i64>()).prop_map(|(k, d)| PlanOp::Ups(vec![k], d)),
             1 => Just(PlanOp::Commit),
         ],
         50..=400,
@@ -321,10 +414,8 @@ fn run_case(case: &CrashCase, images: &AtomicU64) -> Result<(), TestCaseError> {
     let mut before_final = 0;
     for (i, op) in ops.iter().enumerate() {
         match op {
-            PlanOp::Ins(k, v) => {
-                keys.insert(k.clone());
-                engine.insert(k.clone(), v.clone());
-                oracle.insert(k.clone(), v.clone());
+            PlanOp::Ins(..) | PlanOp::Del(..) | PlanOp::Ups(..) => {
+                apply_plan_op(&mut engine, &mut oracle, &mut keys, op);
             }
             PlanOp::Commit => {
                 if i == ops.len() - 1 {
@@ -449,6 +540,22 @@ fn crash_overwrite_heavy() {
     run_crash_suite("crash_overwrite_heavy", crash_case(overwrite_body()));
 }
 
+#[test]
+fn crash_delete_heavy() {
+    run_crash_suite(
+        "crash_delete_heavy",
+        crash_case(prop_oneof![
+            3 => delete_heavy_body(),
+            1 => delete_all_body(),
+        ]),
+    );
+}
+
+#[test]
+fn crash_upsert_heavy() {
+    run_crash_suite("crash_upsert_heavy", crash_case(upsert_heavy_body()));
+}
+
 // ---------------------------------------------------------------------
 // Sync-failure injection (fsyncgate): a failed sync poisons the engine,
 // and recovery from any crash image afterwards still honors A1–A5.
@@ -514,10 +621,8 @@ fn run_sync_fail_case(case: &SyncFailCase, images: &AtomicU64) -> Result<(), Tes
     let mut commit_index = 0;
     for op in &ops {
         match op {
-            PlanOp::Ins(k, v) => {
-                keys.insert(k.clone());
-                engine.insert(k.clone(), v.clone());
-                oracle.insert(k.clone(), v.clone());
+            PlanOp::Ins(..) | PlanOp::Del(..) | PlanOp::Ups(..) => {
+                apply_plan_op(&mut engine, &mut oracle, &mut keys, op);
             }
             PlanOp::Commit => {
                 if commit_index == target {

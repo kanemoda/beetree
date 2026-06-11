@@ -1,9 +1,11 @@
-//! The real Bε-tree engine (M0.2).
+//! The real Bε-tree engine (M0.2; full message algebra since M2.1).
 //!
-//! Writes become messages that settle into internal-node buffers and
-//! migrate toward the leaves in batches; reads walk root→leaf and the
-//! topmost buffer hit wins. Flushes follow the normative greedy-fullest
-//! policy (`docs/SPEC.md`, "Baseline flush policy"). Splits propagate via
+//! Mutations become messages — puts, tombstones, upserts — that settle
+//! into internal-node buffers and migrate toward the leaves in batches;
+//! reads walk root→leaf folding the pending upsert chain over the first
+//! Put/Delete/leaf terminal (`docs/SPEC.md`, "Reads"). Flushes follow the
+//! normative greedy-fullest policy ("Baseline flush policy") and reclaim
+//! emptied leaves as they go ("Reclamation v1"). Splits propagate via
 //! return values (ADR-0005); nodes live in an append-only arena (ADR-0004).
 
 use std::collections::BTreeMap;
@@ -11,9 +13,12 @@ use std::mem;
 
 use crate::check::{self, NodeSource};
 use crate::engine::KvEngine;
-use crate::node::{LeafEntry, Node, NodeId, partition_sizes, route};
-use crate::trace::{OpKind, TraceEvent};
-use crate::types::{InvariantViolation, Key, Message, Params, Value};
+use crate::node::{
+    Delivery, LeafEntry, Node, NodeId, Outcome, apply_chain, apply_to_leaf, coalesce_into,
+    partition_sizes, route,
+};
+use crate::trace::{OpKind2, Recorder, TraceEvent, TraceEvent2};
+use crate::types::{InvariantViolation, Key, Message, Params, UpsertOp, Value};
 
 /// A Bε-tree key-value engine (`docs/SPEC.md`).
 ///
@@ -31,12 +36,13 @@ use crate::types::{InvariantViolation, Key, Message, Params, Value};
 #[derive(Debug)]
 pub struct BeTree {
     params: Params,
-    /// Arena: nodes are addressed by index and never freed in M0
-    /// (insert-only ⇒ no merges; ADR-0004).
+    /// Arena: nodes are addressed by index and never freed — unlinked
+    /// nodes (emptied leaves, collapsed roots; M2.1) simply leak here
+    /// (ADR-0004).
     nodes: Vec<Node>,
     root: NodeId,
     next_seq: u64,
-    trace: Vec<TraceEvent>,
+    trace: Recorder,
 }
 
 /// The invariant checker resolves nodes straight out of the arena
@@ -80,20 +86,33 @@ impl BeTree {
         id
     }
 
-    /// Re-establish capacity invariants at the root after an insert,
-    /// growing the tree upward as needed. Every promoted piece sits at the
-    /// same depth as the old root, so a new root above them keeps all
-    /// leaves at uniform depth (I6).
+    /// Re-establish capacity invariants at the root after a public
+    /// mutating op, growing the tree upward (splits) or shrinking it
+    /// (reclamation; SPEC "Reclamation v1") as needed. Every promoted
+    /// piece sits at the same depth as the old root, so a new root above
+    /// them keeps all leaves at uniform depth (I6).
     fn restore_root(&mut self) {
         loop {
             let root_is_internal = matches!(&self.nodes[self.root as usize], Node::Internal { .. });
-            let promoted = if root_is_internal {
+            let outcome = if root_is_internal {
                 self.flush_overfull(self.root)
             } else {
-                self.split_if_needed(self.root)
+                Outcome::Splits(self.split_if_needed(self.root))
+            };
+            let promoted = match outcome {
+                Outcome::Removed => {
+                    // Every key range beneath the root emptied out: the
+                    // tree is the empty tree again — its initial state, a
+                    // single empty leaf. The old root leaks (ADR-0004).
+                    self.root = self.alloc(Node::Leaf {
+                        entries: BTreeMap::new(),
+                    });
+                    break;
+                }
+                Outcome::Splits(promoted) => promoted,
             };
             if promoted.is_empty() {
-                return;
+                break;
             }
             let mut pivots = Vec::with_capacity(promoted.len());
             let mut children = Vec::with_capacity(promoted.len() + 1);
@@ -111,12 +130,27 @@ impl BeTree {
             // into many pieces under tiny L); the next iteration splits it
             // again, growing the height by one more level.
         }
+        // Root collapse (SPEC "Reclamation v1"): promote a lone child
+        // while the root's buffer is empty. A non-empty buffer is NOT
+        // force-flushed — a stale tall root is harmless and collapses on
+        // a later op once its buffer drains.
+        loop {
+            match &self.nodes[self.root as usize] {
+                Node::Internal {
+                    children, buffer, ..
+                } if children.len() == 1 && buffer.is_empty() => {
+                    self.root = children[0];
+                }
+                _ => break,
+            }
+        }
     }
 
     /// Flush this internal node's buffer until it holds ≤ B messages, then
-    /// split the node itself if its fanout overflowed. Returns the promoted
-    /// (pivot, new-right-sibling) pairs the caller must integrate
-    /// (ADR-0005).
+    /// settle the node itself: split it if its fanout overflowed, or
+    /// signal [`Outcome::Removed`] if deliveries emptied every child out
+    /// from under it. The caller integrates splits or unlinks the node
+    /// (ADR-0005; SPEC "Reclamation v1").
     ///
     /// The cascade only ever pushes messages strictly downward, so it walks
     /// root→leaf and never revisits a level — but it is processed with an
@@ -124,7 +158,7 @@ impl BeTree {
     /// tree height, and legal-but-degenerate parameters make height linear
     /// in the number of inserts (F=2 under sorted insertion; `docs/SPEC.md`,
     /// "Structure parameters"), which would overflow the call stack.
-    fn flush_overfull(&mut self, id: NodeId) -> Vec<(Key, NodeId)> {
+    fn flush_overfull(&mut self, id: NodeId) -> Outcome {
         // Nodes currently flushing, cascade root first. A node below the
         // top of the stack is waiting for its overfull child above it.
         let mut flushing: Vec<NodeId> = vec![id];
@@ -133,34 +167,87 @@ impl BeTree {
                 .last()
                 .expect("the flush stack only empties via the return below");
             if self.buffer_len(top) <= self.params.buffer_capacity {
-                // `top` is done: split it if its fanout overflowed and hand
-                // the promoted pairs to the frame below (its parent in the
-                // cascade), or to the caller for the cascade root.
-                let promoted = self.split_if_needed(top);
+                // `top` is done: hand its outcome to the frame below (its
+                // parent in the cascade), or to the caller for the
+                // cascade root.
+                let outcome = self.settle(top);
                 flushing.pop();
                 match flushing.last() {
-                    Some(&parent) => self.integrate_splits(parent, promoted),
-                    None => return promoted,
+                    Some(&parent) => match outcome {
+                        Outcome::Splits(promoted) => self.integrate_splits(parent, promoted),
+                        Outcome::Removed => self.remove_child(parent, top),
+                    },
+                    None => return outcome,
                 }
                 continue;
             }
             let (chosen, child_id, child_occupancies, batch) = self.pick_and_extract(top);
-            self.trace.push(TraceEvent::FlushDecision {
-                node: top,
-                child_occupancies,
-                chosen,
-            });
-            if self.apply_batch(child_id, batch) {
-                // The child's buffer now overflows too: flush it to
-                // completion before continuing with `top`.
-                flushing.push(child_id);
-            } else {
-                // Integrate split pieces immediately: child indices shift,
-                // so the next iteration recomputes routing from scratch
-                // rather than caching it across iterations.
-                let promoted = self.split_if_needed(child_id);
-                self.integrate_splits(top, promoted);
+            self.trace.flush_decision(top, child_occupancies, chosen);
+            match self.apply_batch(child_id, batch) {
+                Delivery::Internal { overflowed: true } => {
+                    // The child's buffer now overflows too: flush it to
+                    // completion before continuing with `top`.
+                    flushing.push(child_id);
+                }
+                Delivery::Internal { overflowed: false } | Delivery::Leaf { emptied: false } => {
+                    // Integrate split pieces immediately: child indices
+                    // shift, so the next iteration recomputes routing from
+                    // scratch rather than caching it across iterations.
+                    let promoted = self.split_if_needed(child_id);
+                    self.integrate_splits(top, promoted);
+                }
+                Delivery::Leaf { emptied: true } => {
+                    // The delivery annihilated the leaf's last entries:
+                    // reclaim it right now (I7) — a delivery cannot both
+                    // split and empty.
+                    self.remove_child(top, child_id);
+                }
             }
+        }
+    }
+
+    /// A flushed node's parting word to its parent: [`Outcome::Removed`]
+    /// for an internal node whose children were all reclaimed (its buffer
+    /// is necessarily empty: the messages went down with the deliveries
+    /// that emptied them), else its split pieces.
+    fn settle(&mut self, id: NodeId) -> Outcome {
+        if let Node::Internal {
+            children, buffer, ..
+        } = &self.nodes[id as usize]
+        {
+            if children.is_empty() {
+                debug_assert!(
+                    buffer.is_empty(),
+                    "a node that lost every child has delivered every message"
+                );
+                return Outcome::Removed;
+            }
+        }
+        Outcome::Splits(self.split_if_needed(id))
+    }
+
+    /// Unlink a reclaimed child (SPEC "Reclamation v1"): drop it and its
+    /// adjacent pivot — the left pivot if one exists, else the right one —
+    /// so the neighbor absorbs the emptied key range. A parent reduced to
+    /// a single child PERSISTS (fanout-1 internals are legal; same
+    /// degeneracy class as F=2); one reduced to zero children signals
+    /// [`Outcome::Removed`] when it settles.
+    fn remove_child(&mut self, parent: NodeId, child: NodeId) {
+        let Node::Internal {
+            pivots, children, ..
+        } = &mut self.nodes[parent as usize]
+        else {
+            unreachable!("children are only ever removed from internal nodes")
+        };
+        let at = children
+            .iter()
+            .position(|&c| c == child)
+            .expect("the removed node is a child of this parent");
+        children.remove(at);
+        if at > 0 {
+            pivots.remove(at - 1);
+        } else if !pivots.is_empty() {
+            pivots.remove(0);
         }
     }
 
@@ -209,32 +296,27 @@ impl BeTree {
         (chosen, children[chosen], occupancies, batch)
     }
 
-    /// Apply a flushed batch to `child_id` (leaf: materialize entries;
-    /// internal: coalesce into the buffer). Returns true iff the child is
-    /// internal and its buffer now exceeds B, i.e. it must flush next.
-    fn apply_batch(&mut self, child_id: NodeId, batch: BTreeMap<Key, Message>) -> bool {
+    /// Apply a flushed batch to `child_id` (leaf: materialize entries per
+    /// the message kinds — tombstones annihilate; internal: coalesce into
+    /// the buffer per the normative table) and report what the delivery
+    /// did, so the flush loop can split, recurse, or reclaim.
+    fn apply_batch(&mut self, child_id: NodeId, batch: BTreeMap<Key, Message>) -> Delivery {
         match &mut self.nodes[child_id as usize] {
             Node::Leaf { entries } => {
                 for (key, message) in batch {
-                    let Message::Put { seq, value } = message;
-                    let old = entries.insert(key, LeafEntry { seq, value });
-                    debug_assert!(
-                        old.is_none_or(|e| e.seq < seq),
-                        "I3: an incoming message must be newer than the leaf entry it replaces"
-                    );
+                    apply_to_leaf(entries, key, message);
                 }
-                false
+                Delivery::Leaf {
+                    emptied: entries.is_empty(),
+                }
             }
             Node::Internal { buffer, .. } => {
                 for (key, message) in batch {
-                    let seq = message.seq();
-                    let old = buffer.insert(key, message);
-                    debug_assert!(
-                        old.is_none_or(|m| m.seq() < seq),
-                        "I3: an incoming message must be newer than the buffered one it coalesces"
-                    );
+                    coalesce_into(buffer, key, message);
                 }
-                buffer.len() > self.params.buffer_capacity
+                Delivery::Internal {
+                    overflowed: buffer.len() > self.params.buffer_capacity,
+                }
             }
         }
     }
@@ -374,6 +456,19 @@ impl BeTree {
     }
 }
 
+impl BeTree {
+    /// The shared tail of every public mutating op: route the message at
+    /// the root (leaf root: materialize; internal root: coalesce into the
+    /// buffer, ADR-0003) and re-settle the tree.
+    fn apply_root(&mut self, key: Key, message: Message) {
+        match &mut self.nodes[self.root as usize] {
+            Node::Leaf { entries } => apply_to_leaf(entries, key, message),
+            Node::Internal { buffer, .. } => coalesce_into(buffer, key, message),
+        }
+        self.restore_root();
+    }
+}
+
 impl KvEngine for BeTree {
     fn new(params: Params) -> Self {
         assert!(
@@ -387,42 +482,50 @@ impl KvEngine for BeTree {
             }],
             root: 0,
             next_seq: 0,
-            trace: Vec::new(),
+            trace: Recorder::default(),
         }
     }
 
     fn insert(&mut self, key: Key, value: Value) {
         self.next_seq += 1;
         let seq = self.next_seq;
-        self.trace.push(TraceEvent::Op {
+        self.trace.op(
             seq,
-            op: OpKind::Insert {
+            OpKind2::Insert {
                 key: key.clone(),
                 value: value.clone(),
             },
-        });
-        match &mut self.nodes[self.root as usize] {
-            Node::Leaf { entries } => {
-                let old = entries.insert(key, LeafEntry { seq, value });
-                debug_assert!(
-                    old.is_none_or(|e| e.seq < seq),
-                    "seqnos are monotonic, so a replaced root-leaf entry must be older"
-                );
-            }
-            Node::Internal { buffer, .. } => {
-                // Coalesce into the root buffer (ADR-0003): newest wins.
-                let old = buffer.insert(key, Message::Put { seq, value });
-                debug_assert!(
-                    old.is_none_or(|m| m.seq() < seq),
-                    "seqnos are monotonic, so a coalesced-away message must be older"
-                );
-            }
-        }
-        self.restore_root();
+        );
+        self.apply_root(key, Message::Put { seq, value });
+    }
+
+    fn delete(&mut self, key: Key) {
+        self.next_seq += 1;
+        let seq = self.next_seq;
+        self.trace.op(seq, OpKind2::Delete { key: key.clone() });
+        self.apply_root(key, Message::Delete { seq });
+    }
+
+    fn upsert(&mut self, key: Key, op: UpsertOp) {
+        self.next_seq += 1;
+        let seq = self.next_seq;
+        self.trace.op(
+            seq,
+            OpKind2::Upsert {
+                key: key.clone(),
+                op,
+            },
+        );
+        self.apply_root(key, Message::Upsert { seq, op });
     }
 
     fn get(&mut self, key: &[u8]) -> Option<Value> {
-        self.trace.push(TraceEvent::Get { key: key.to_vec() });
+        self.trace.get(key);
+        // Walk root→leaf accumulating the pending-upsert chain (SPEC,
+        // "Reads"): by I3 every occurrence above is newer, so a Put or
+        // Delete terminates the walk (everything below is shadowed) while
+        // upserts stack — a running wrapping sum suffices for Add.
+        let mut chain: Option<i64> = None;
         let mut id = self.root;
         loop {
             match &self.nodes[id as usize] {
@@ -431,15 +534,24 @@ impl KvEngine for BeTree {
                     children,
                     buffer,
                 } => {
-                    // A buffer hit can be returned immediately: by I3
-                    // (freshness order), the topmost occurrence of a key on
-                    // the root→leaf path is the newest.
-                    if let Some(Message::Put { value, .. }) = buffer.get(key) {
-                        return Some(value.clone());
+                    match buffer.get(key) {
+                        Some(Message::Put { value, .. }) => {
+                            return apply_chain(chain, Some(value));
+                        }
+                        Some(Message::Delete { .. }) => return apply_chain(chain, None),
+                        Some(Message::Upsert {
+                            op: UpsertOp::Add(delta),
+                            ..
+                        }) => {
+                            chain = Some(chain.unwrap_or(0).wrapping_add(*delta));
+                        }
+                        None => {}
                     }
                     id = children[route(pivots, key)];
                 }
-                Node::Leaf { entries } => return entries.get(key).map(|e| e.value.clone()),
+                Node::Leaf { entries } => {
+                    return apply_chain(chain, entries.get(key).map(|e| e.value.as_slice()));
+                }
             }
         }
     }
@@ -449,7 +561,11 @@ impl KvEngine for BeTree {
     }
 
     fn trace(&self) -> &[TraceEvent] {
-        &self.trace
+        self.trace.v1()
+    }
+
+    fn trace2(&self) -> &[TraceEvent2] {
+        self.trace.v2()
     }
 }
 
@@ -488,6 +604,310 @@ mod tests {
         }
         for pivot in &all_pivots {
             assert_eq!(tree.get(pivot), Some(b"updated".to_vec()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod m21_tests {
+    use super::*;
+
+    fn le(n: i64) -> Value {
+        n.to_le_bytes().to_vec()
+    }
+
+    /// Node ids along `key`'s root→leaf route.
+    fn route_path(tree: &BeTree, key: &[u8]) -> Vec<NodeId> {
+        let mut path = vec![tree.root];
+        let mut id = tree.root;
+        while let Node::Internal {
+            pivots, children, ..
+        } = &tree.nodes[id as usize]
+        {
+            id = children[route(pivots, key)];
+            path.push(id);
+        }
+        path
+    }
+
+    /// Every reachable node, root first.
+    fn reachable(tree: &BeTree) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack = vec![tree.root];
+        while let Some(id) = stack.pop() {
+            out.push(id);
+            if let Node::Internal { children, .. } = &tree.nodes[id as usize] {
+                stack.extend(children.iter().copied());
+            }
+        }
+        out
+    }
+
+    /// Assert `key` appears in NO reachable buffer and NO reachable leaf.
+    fn assert_annihilated(tree: &BeTree, key: &[u8]) {
+        for id in reachable(tree) {
+            match &tree.nodes[id as usize] {
+                Node::Leaf { entries } => assert!(
+                    !entries.contains_key(key),
+                    "leaf {id} still holds an entry for {key:?}"
+                ),
+                Node::Internal { buffer, .. } => assert!(
+                    !buffer.contains_key(key),
+                    "node {id} still buffers a message for {key:?}"
+                ),
+            }
+        }
+    }
+
+    /// Drain every internal buffer on `key`'s path (white-box scaffolding:
+    /// makes the next flush decisions involving `key` deterministic; the
+    /// discarded messages belong to other keys and no invariant requires
+    /// their presence).
+    fn drain_path_buffers(tree: &mut BeTree, key: &[u8]) {
+        for id in route_path(tree, key) {
+            if let Node::Internal { buffer, .. } = &mut tree.nodes[id as usize] {
+                buffer.clear();
+            }
+        }
+    }
+
+    /// Tombstone lifecycle: a key is inserted and flushed down to a leaf;
+    /// its delete then travels the same path and ANNIHILATES at the leaf —
+    /// entry gone, no resident tombstone anywhere (the leaf is the
+    /// authoritative bottom), I1–I7 green throughout.
+    #[test]
+    fn tombstone_annihilates_at_the_leaf() {
+        let params = Params {
+            fanout: 4,
+            buffer_capacity: 1,
+            leaf_capacity: 4,
+        };
+        let mut tree = BeTree::new(params);
+        let mut i = 0u16;
+        while tree.height() < 2 || i < 24 {
+            tree.insert((i * 4).to_be_bytes().to_vec(), le(i as i64));
+            i += 1;
+            assert!(i < 500, "build phase failed to grow the tree");
+        }
+        // Pick a leaf with at least two entries: the victim plus the twin
+        // that pumps the tombstone down without emptying the leaf.
+        let (victim, twin) = reachable(&tree)
+            .into_iter()
+            .find_map(|id| match &tree.nodes[id as usize] {
+                Node::Leaf { entries } if entries.len() >= 2 => {
+                    let mut keys = entries.keys();
+                    Some((
+                        keys.next().unwrap().clone(),
+                        keys.next_back().unwrap().clone(),
+                    ))
+                }
+                _ => None,
+            })
+            .expect("some leaf holds two entries");
+
+        drain_path_buffers(&mut tree, &victim);
+        tree.delete(victim.clone());
+        // The tombstone sits buffered somewhere on the path; pump its
+        // full-path twin so the cascade carries both to the leaf.
+        tree.insert(twin.clone(), b"pump".to_vec());
+        tree.insert(twin.clone(), b"pump2".to_vec());
+
+        assert_eq!(tree.get(&victim), None);
+        assert_annihilated(&tree, &victim);
+        tree.check_invariants().unwrap();
+    }
+
+    /// Reclamation v1 end-to-end: build a multi-level tree, delete
+    /// EVERYTHING, and the tree must collapse back to a single empty root
+    /// leaf (the initial state) — then keep working. Prints the numbers
+    /// the M2.1 report wants.
+    #[test]
+    fn delete_everything_collapses_to_the_empty_tree() {
+        let mut tree = BeTree::new(Params::default());
+        for b in 0..=255u8 {
+            tree.insert(vec![b], vec![b]);
+        }
+        let height_before = tree.height();
+        let arena_before = tree.node_count();
+        let live_before = reachable(&tree).len();
+        assert!(height_before >= 3, "256 keys must build a real tree");
+
+        for b in 0..=255u8 {
+            tree.delete(vec![b]);
+            tree.check_invariants().unwrap();
+        }
+        // One pass leaves up to B resting tombstones per level: buffers
+        // only move on overflow and the root is never force-flushed (SPEC,
+        // "Reclamation v1" — a stale tall root is harmless). Further
+        // delete passes are semantic no-ops (every key already reads
+        // None) whose tombstones drive the resting ones down by ordinary
+        // overflow until the structure fully collapses.
+        let mut extra_rounds = 0;
+        while tree.height() > 1 {
+            extra_rounds += 1;
+            assert!(extra_rounds <= 8, "reclamation failed to converge");
+            for b in 0..=255u8 {
+                tree.delete(vec![b]);
+            }
+            tree.check_invariants().unwrap();
+        }
+        let height_after = tree.height();
+        let arena_after = tree.node_count();
+        let live_after = reachable(&tree).len();
+
+        assert_eq!(height_after, 1, "the tree must collapse to a root leaf");
+        assert_eq!(live_after, 1, "exactly the empty root leaf remains live");
+        match &tree.nodes[tree.root as usize] {
+            Node::Leaf { entries } => assert!(entries.is_empty(), "the root leaf must be empty"),
+            Node::Internal { .. } => panic!("the root must be a leaf again"),
+        }
+        for b in 0..=255u8 {
+            assert_eq!(tree.get(&[b]), None);
+        }
+        println!(
+            "delete-all experiment: height {height_before} -> {height_after}, \
+             live nodes {live_before} -> {live_after}, \
+             arena slots {arena_before} -> {arena_after} (leaked by design, ADR-0004); \
+             extra idempotent delete passes to drive resting tombstones: {extra_rounds}"
+        );
+
+        // The emptied tree is a normal engine again.
+        for b in 0..=255u8 {
+            tree.insert(vec![b], vec![b, b]);
+        }
+        tree.check_invariants().unwrap();
+        for b in 0..=255u8 {
+            assert_eq!(tree.get(&[b]), Some(vec![b, b]));
+        }
+    }
+
+    /// Stacked upserts across three tree levels, built via controlled
+    /// flushes, resolving on a single get: root buffer Upsert(+30), mid
+    /// buffer Upsert(+20), leaf entry 10 — get folds them to 60. Prints
+    /// the placement and the trace excerpt for the M2.1 report.
+    #[test]
+    fn upsert_stack_across_three_levels_resolves_on_get() {
+        let params = Params {
+            fanout: 4,
+            buffer_capacity: 1,
+            leaf_capacity: 4,
+        };
+        let mut tree = BeTree::new(params);
+        let mut i = 0u16;
+        while tree.height() < 3 {
+            tree.insert((i * 4).to_be_bytes().to_vec(), le(i as i64));
+            i += 1;
+            assert!(i < 2000, "build phase failed to reach height 3");
+        }
+
+        // K: an odd (never-inserted) key whose depth-2 path node has a
+        // lower sibling child to flush decoys into.
+        let (key, mid) = (1u16..2000)
+            .step_by(2)
+            .find_map(|k| {
+                let key = k.to_be_bytes().to_vec();
+                let path = route_path(&tree, &key);
+                let mid = path[1];
+                let Node::Internal { pivots, .. } = &tree.nodes[mid as usize] else {
+                    return None;
+                };
+                (route(pivots, &key) >= 1).then_some((key, mid))
+            })
+            .expect("some key has a lower sibling at depth 2");
+
+        // W: an existing key sharing K's ENTIRE path (a co-tenant of K's
+        // leaf) — pumping it cascades a batch all the way down. W2: an
+        // existing key under `mid`'s next-lower child — same root child as
+        // K, lower child inside `mid`, so the tie-break flushes W2's range
+        // and K's upsert PARKS at `mid`.
+        let path = route_path(&tree, &key);
+        let leaf = *path.last().unwrap();
+        let Node::Leaf { entries } = &tree.nodes[leaf as usize] else {
+            unreachable!()
+        };
+        let w = entries.keys().next().expect("leaves are non-empty").clone();
+        let Node::Internal {
+            pivots, children, ..
+        } = &tree.nodes[mid as usize]
+        else {
+            unreachable!()
+        };
+        let lower_sibling = children[route(pivots, &key) - 1];
+        let mut probe = lower_sibling;
+        let w2 = loop {
+            match &tree.nodes[probe as usize] {
+                Node::Internal { children, .. } => probe = children[0],
+                Node::Leaf { entries } => {
+                    break entries.keys().next().expect("leaves are non-empty").clone();
+                }
+            }
+        };
+
+        // Level 3: drive the first upsert all the way to the leaf.
+        drain_path_buffers(&mut tree, &key);
+        tree.upsert(key.clone(), UpsertOp::Add(10));
+        tree.insert(w.clone(), b"pump".to_vec());
+        let path = route_path(&tree, &key);
+        let leaf = *path.last().unwrap();
+        match &tree.nodes[leaf as usize] {
+            Node::Leaf { entries } => assert_eq!(
+                entries.get(&key).map(|e| e.value.clone()),
+                Some(le(10)),
+                "the first upsert must have materialized at the leaf"
+            ),
+            Node::Internal { .. } => unreachable!(),
+        }
+
+        // Level 2: park the second upsert at `mid`.
+        drain_path_buffers(&mut tree, &key);
+        tree.upsert(key.clone(), UpsertOp::Add(20));
+        tree.insert(w2.clone(), b"pump".to_vec());
+        let mid = route_path(&tree, &key)[1];
+        match &tree.nodes[mid as usize] {
+            Node::Internal { buffer, .. } => assert!(
+                matches!(
+                    buffer.get(&key),
+                    Some(Message::Upsert {
+                        op: UpsertOp::Add(20),
+                        ..
+                    })
+                ),
+                "the second upsert must be parked in the mid-level buffer, found {:?}",
+                buffer.get(&key)
+            ),
+            Node::Leaf { .. } => unreachable!(),
+        }
+
+        // Level 1: the third upsert rests in the root buffer.
+        tree.upsert(key.clone(), UpsertOp::Add(30));
+        match &tree.nodes[tree.root as usize] {
+            Node::Internal { buffer, .. } => assert!(
+                matches!(
+                    buffer.get(&key),
+                    Some(Message::Upsert {
+                        op: UpsertOp::Add(30),
+                        ..
+                    })
+                ),
+                "the third upsert must rest in the root buffer"
+            ),
+            Node::Leaf { .. } => unreachable!(),
+        }
+
+        // One get folds the whole stack: 10 + 20 + 30.
+        assert_eq!(tree.get(&key), Some(le(60)));
+        tree.check_invariants().unwrap();
+
+        println!(
+            "3-level upsert stack on key {key:?}: root buffer Add(30) @ node {}, \
+             mid buffer Add(20) @ node {mid}, leaf entry 10 @ node {leaf}; \
+             get folded them to 60",
+            tree.root
+        );
+        let trace = tree.trace2();
+        println!("trace excerpt (last 8 events):");
+        for event in &trace[trace.len().saturating_sub(8)..] {
+            println!("  {event:?}");
         }
     }
 }

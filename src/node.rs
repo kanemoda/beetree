@@ -1,10 +1,11 @@
 //! Tree node representation for the Bε-tree (`crate::betree`).
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Key, Message, Value};
+use crate::types::{Key, Message, UpsertOp, Value};
 
 /// Index of a node in the arena (`BeTree::nodes`, ADR-0004; `DiskEngine`
 /// slots, M1.1).
@@ -44,6 +45,102 @@ pub(crate) enum Node {
 /// child on the pivot's RIGHT.
 pub(crate) fn route(pivots: &[Key], key: &[u8]) -> usize {
     pivots.partition_point(|p| p.as_slice() <= key)
+}
+
+/// What delivering one batch did to the receiving child — the engines'
+/// flush loops branch on this (SPEC, "Reclamation v1").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// The batch materialized into a leaf; `emptied` means the leaf now
+    /// holds zero entries and must be reclaimed by its parent. A single
+    /// delivery cannot both split and empty.
+    Leaf {
+        /// True iff the leaf ended the delivery with no entries.
+        emptied: bool,
+    },
+    /// The batch coalesced into an internal child's buffer; `overflowed`
+    /// means the child's buffer now exceeds B and it must flush next.
+    Internal {
+        /// True iff the child's buffer now exceeds its capacity.
+        overflowed: bool,
+    },
+}
+
+/// What a node's settling (end of its flush) hands to its parent (SPEC,
+/// "Reclamation v1"): promoted split pieces — possibly none — or the
+/// signal that the node emptied out entirely and must be unlinked.
+#[derive(Debug)]
+pub(crate) enum Outcome {
+    /// Promoted (pivot, new-right-sibling) pairs; empty when nothing
+    /// split (ADR-0005).
+    Splits(Vec<(Key, NodeId)>),
+    /// The node has no contents left (an internal that lost every child):
+    /// the parent must drop it and its adjacent pivot.
+    Removed,
+}
+
+/// Apply one message to a leaf's entries (SPEC, "Semantics"): the leaf is
+/// the authoritative bottom — nothing exists below it — so a `Put` sets
+/// the entry, a `Delete` REMOVES it outright (leaves never store
+/// tombstones), and an `Upsert` materializes per [`UpsertOp::apply`],
+/// each stamped with the message's seq.
+pub(crate) fn apply_to_leaf(entries: &mut BTreeMap<Key, LeafEntry>, key: Key, message: Message) {
+    match message {
+        Message::Put { seq, value } => {
+            let old = entries.insert(key, LeafEntry { seq, value });
+            debug_assert!(
+                old.is_none_or(|e| e.seq < seq),
+                "I3: an incoming message must be newer than the leaf entry it replaces"
+            );
+        }
+        Message::Delete { seq } => {
+            let old = entries.remove(&key);
+            debug_assert!(
+                old.is_none_or(|e| e.seq < seq),
+                "I3: an incoming tombstone must be newer than the entry it removes"
+            );
+        }
+        Message::Upsert { seq, op } => {
+            let existing = entries.get(&key);
+            debug_assert!(
+                existing.is_none_or(|e| e.seq < seq),
+                "I3: an incoming upsert must be newer than the entry it transforms"
+            );
+            let value = op.apply(existing.map(|e| e.value.as_slice()));
+            entries.insert(key, LeafEntry { seq, value });
+        }
+    }
+}
+
+/// Coalesce one message into a buffer (ADR-0003): if the key already has
+/// a buffered message, the newer one absorbs it per the normative table
+/// ([`Message::coalesce`]); invariant I4 stays structural.
+pub(crate) fn coalesce_into(buffer: &mut BTreeMap<Key, Message>, key: Key, message: Message) {
+    match buffer.entry(key) {
+        Entry::Occupied(mut occupied) => {
+            debug_assert!(
+                occupied.get().seq() < message.seq(),
+                "I3: an incoming message must be newer than the buffered one it coalesces"
+            );
+            let merged = message.coalesce(occupied.get());
+            occupied.insert(merged);
+        }
+        Entry::Vacant(vacant) => {
+            vacant.insert(message);
+        }
+    }
+}
+
+/// Resolve a get's accumulated upsert chain against the terminal it
+/// reached (SPEC, "Reads"): `chain` is the wrapping sum of every pending
+/// `Add` seen on the root→leaf path (None when no upsert was seen), and
+/// `existing` is the terminal base — a buffered `Put`'s value, a leaf
+/// entry's value, or None for a `Delete` terminal / absent key.
+pub(crate) fn apply_chain(chain: Option<i64>, existing: Option<&[u8]>) -> Option<Value> {
+    match chain {
+        None => existing.map(<[u8]>::to_vec),
+        Some(sum) => Some(UpsertOp::Add(sum).apply(existing)),
+    }
 }
 
 /// Sizes of the pieces an overfull collection of `n` items splits into,

@@ -12,9 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::engine::KvEngine;
 use crate::types::{Key, Params, Value};
 
-/// What a recorded public mutating operation did.
+/// What a recorded public mutating operation did — the M0 (v1)
+/// vocabulary.
 ///
-/// M0 is insert-only; deletes and upserts will add variants here.
+/// This enum is CLOSED: the byte-frozen `tests/harness.rs` matches over
+/// it exhaustively, so deletes and upserts live in [`OpKind2`] instead
+/// (M2.1; ADR-0013).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpKind {
     /// `insert(key, value)`.
@@ -142,5 +145,146 @@ mod tests {
         }];
         let text = format!("\n{}\n\n", to_jsonl(&events).unwrap());
         assert_eq!(from_jsonl(&text).unwrap(), events);
+    }
+}
+
+// ---------------------------------------------------------------------
+// The v2 trace vocabulary (M2.1; ADR-0013).
+//
+// The frozen M0 harness matches exhaustively over `TraceEvent` and
+// `OpKind`, so those enums are CLOSED — adding variants would break the
+// byte-frozen `tests/harness.rs` at compile time. Delete and upsert
+// therefore live in a parallel, full-fidelity vocabulary. `KvEngine::
+// trace()` keeps returning the v1 view (faithful for insert-only
+// workloads — exactly what the frozen harness generates); `trace2()` is
+// the complete record and the only view safe to replay for mixed
+// workloads.
+
+use crate::types::UpsertOp;
+
+/// What a recorded public mutating operation did — the complete M2.1
+/// vocabulary (ADR-0013).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpKind2 {
+    /// `insert(key, value)`.
+    Insert {
+        /// The key written.
+        key: Key,
+        /// The value written.
+        value: Value,
+    },
+    /// `delete(key)`.
+    Delete {
+        /// The key removed.
+        key: Key,
+    },
+    /// `upsert(key, op)`.
+    Upsert {
+        /// The key transformed.
+        key: Key,
+        /// The transformation applied.
+        op: UpsertOp,
+    },
+}
+
+/// One event in an engine's complete (v2) trace. Mirrors [`TraceEvent`]
+/// with the full op vocabulary; the same recording rules apply (mutating
+/// ops carry seqnos, reads and flush decisions do not).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TraceEvent2 {
+    /// A public mutating op and the global seqno it was assigned.
+    Op {
+        /// Global sequence number assigned to this op.
+        seq: u64,
+        /// The operation performed.
+        op: OpKind2,
+    },
+    /// A public read (seqno-free; skipped by replay; ADR-0006).
+    Get {
+        /// The key probed.
+        key: Key,
+    },
+    /// An internal node chose which child to flush its buffer toward
+    /// (descriptive, not normative; skipped by replay).
+    FlushDecision {
+        /// Identifier of the flushing node.
+        node: u64,
+        /// Pending buffered-message count per child at decision time.
+        child_occupancies: Vec<usize>,
+        /// Index into `child_occupancies` of the child flushed to.
+        chosen: usize,
+    },
+}
+
+/// Rebuild an engine by re-applying the `Op` events of a complete (v2)
+/// trace, in order — the only replay that is faithful for workloads
+/// containing deletes or upserts (ADR-0013).
+pub fn replay2<E: KvEngine>(params: Params, events: &[TraceEvent2]) -> E {
+    let mut engine = E::new(params);
+    for event in events {
+        match event {
+            TraceEvent2::Op { op, .. } => match op {
+                OpKind2::Insert { key, value } => engine.insert(key.clone(), value.clone()),
+                OpKind2::Delete { key } => engine.delete(key.clone()),
+                OpKind2::Upsert { key, op } => engine.upsert(key.clone(), *op),
+            },
+            TraceEvent2::Get { .. } | TraceEvent2::FlushDecision { .. } => {}
+        }
+    }
+    engine
+}
+
+/// The dual-view trace store every engine records into: one push feeds
+/// both the complete v2 trace and the frozen-vocabulary v1 mirror (which
+/// silently omits ops the v1 vocabulary cannot express; ADR-0013).
+#[derive(Debug, Default)]
+pub(crate) struct Recorder {
+    v1: Vec<TraceEvent>,
+    v2: Vec<TraceEvent2>,
+}
+
+impl Recorder {
+    /// Record a public mutating op under its assigned seqno.
+    pub fn op(&mut self, seq: u64, op: OpKind2) {
+        if let OpKind2::Insert { key, value } = &op {
+            self.v1.push(TraceEvent::Op {
+                seq,
+                op: OpKind::Insert {
+                    key: key.clone(),
+                    value: value.clone(),
+                },
+            });
+        }
+        self.v2.push(TraceEvent2::Op { seq, op });
+    }
+
+    /// Record a public read.
+    pub fn get(&mut self, key: &[u8]) {
+        self.v1.push(TraceEvent::Get { key: key.to_vec() });
+        self.v2.push(TraceEvent2::Get { key: key.to_vec() });
+    }
+
+    /// Record a flush decision.
+    pub fn flush_decision(&mut self, node: u64, child_occupancies: Vec<usize>, chosen: usize) {
+        self.v1.push(TraceEvent::FlushDecision {
+            node,
+            child_occupancies: child_occupancies.clone(),
+            chosen,
+        });
+        self.v2.push(TraceEvent2::FlushDecision {
+            node,
+            child_occupancies,
+            chosen,
+        });
+    }
+
+    /// The v1 view (insert-only-faithful; for the frozen harness).
+    pub fn v1(&self) -> &[TraceEvent] {
+        &self.v1
+    }
+
+    /// The complete v2 record.
+    pub fn v2(&self) -> &[TraceEvent2] {
+        &self.v2
     }
 }

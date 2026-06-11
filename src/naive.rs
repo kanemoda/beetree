@@ -3,29 +3,31 @@
 use std::collections::BTreeMap;
 
 use crate::engine::KvEngine;
-use crate::trace::{OpKind, TraceEvent};
-use crate::types::{InvariantViolation, Key, Params, Value};
+use crate::trace::{OpKind2, Recorder, TraceEvent, TraceEvent2};
+use crate::types::{InvariantViolation, Key, Params, UpsertOp, Value};
 
 /// The M0.1 reference engine: a thin shell around [`BTreeMap`].
 ///
-/// It exists to validate the test harness before the real Bε-tree (M0.2)
-/// does. It assigns seqnos and records trace events exactly like a real
-/// engine, but it has no tree structure of its own, so `check_invariants`
-/// is vacuously `Ok`.
+/// It exists to validate the test harnesses before the real engines do.
+/// It assigns seqnos and records trace events exactly like a real engine,
+/// but it has no tree structure of its own, so `check_invariants` is
+/// vacuously `Ok`. Its delete/upsert behavior (M2.1) IS the oracle
+/// semantics: remove the entry; transform per `UpsertOp::apply`.
 ///
 /// ```
-/// use beetree::{KvEngine, NaiveEngine, Params};
+/// use beetree::{KvEngine, NaiveEngine, Params, UpsertOp};
 ///
 /// let mut engine = NaiveEngine::new(Params::default());
 /// engine.insert(b"k".to_vec(), b"v1".to_vec());
-/// engine.insert(b"k".to_vec(), b"v2".to_vec());
-/// assert_eq!(engine.get(b"k"), Some(b"v2".to_vec()));
-/// assert_eq!(engine.trace().len(), 3); // two Op events + one Get event
+/// engine.upsert(b"n".to_vec(), UpsertOp::Add(2));
+/// engine.delete(b"k".to_vec());
+/// assert_eq!(engine.get(b"k"), None);
+/// assert_eq!(engine.get(b"n"), Some(2i64.to_le_bytes().to_vec()));
 /// ```
 pub struct NaiveEngine {
     map: BTreeMap<Key, Value>,
     next_seq: u64,
-    trace: Vec<TraceEvent>,
+    trace: Recorder,
 }
 
 impl KvEngine for NaiveEngine {
@@ -35,24 +37,44 @@ impl KvEngine for NaiveEngine {
         NaiveEngine {
             map: BTreeMap::new(),
             next_seq: 0,
-            trace: Vec::new(),
+            trace: Recorder::default(),
         }
     }
 
     fn insert(&mut self, key: Key, value: Value) {
         self.next_seq += 1;
-        self.trace.push(TraceEvent::Op {
-            seq: self.next_seq,
-            op: OpKind::Insert {
+        self.trace.op(
+            self.next_seq,
+            OpKind2::Insert {
                 key: key.clone(),
                 value: value.clone(),
             },
-        });
+        );
+        self.map.insert(key, value);
+    }
+
+    fn delete(&mut self, key: Key) {
+        self.next_seq += 1;
+        self.trace
+            .op(self.next_seq, OpKind2::Delete { key: key.clone() });
+        self.map.remove(&key);
+    }
+
+    fn upsert(&mut self, key: Key, op: UpsertOp) {
+        self.next_seq += 1;
+        self.trace.op(
+            self.next_seq,
+            OpKind2::Upsert {
+                key: key.clone(),
+                op,
+            },
+        );
+        let value = op.apply(self.map.get(&key).map(|v| v.as_slice()));
         self.map.insert(key, value);
     }
 
     fn get(&mut self, key: &[u8]) -> Option<Value> {
-        self.trace.push(TraceEvent::Get { key: key.to_vec() });
+        self.trace.get(key);
         self.map.get(key).cloned()
     }
 
@@ -61,6 +83,10 @@ impl KvEngine for NaiveEngine {
     }
 
     fn trace(&self) -> &[TraceEvent] {
-        &self.trace
+        self.trace.v1()
+    }
+
+    fn trace2(&self) -> &[TraceEvent2] {
+        self.trace.v2()
     }
 }

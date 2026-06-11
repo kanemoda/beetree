@@ -1,10 +1,13 @@
-# beetree specification — M0 + M1.1
+# beetree specification — M0 + M1 + M2.1
 
-This document is normative for milestones M0 (in-memory engine) and M1.1
-(persistence). The generic property-test harness in `tests/harness.rs`
-enforces the in-memory semantics mechanically; the invariant checker
-enforces I1–I6 structurally. Public API or semantics changes must update
-this file in the same change (see `CLAUDE.md`).
+This document is normative for milestones M0 (in-memory engine), M1
+(persistence and crash safety), and M2.1 (deletes, upserts, reclamation).
+The byte-frozen property-test harness in `tests/harness.rs` enforces the
+insert-only semantics mechanically; the full-mix harness in
+`tests/harness2.rs` (frozen when M2.2 ships) enforces the complete op
+vocabulary; the invariant checker enforces I1–I7 structurally. Public API
+or semantics changes must update this file in the same change (see
+`CLAUDE.md`).
 
 ## Public API (M0 scope)
 
@@ -24,11 +27,46 @@ Key = `Vec<u8>`, Value = `Vec<u8>`.
 ## Semantics
 
 - Last-writer-wins, ordered by a global monotonically increasing seqno (u64),
-  assigned per public mutating op.
-- Writes become Messages: `Put { seq, value }`. Messages live in internal-node
-  buffers and migrate downward via flushes; leaves store materialized entries.
-- `get` must observe the NEWEST message for the key: walk root→leaf, topmost
-  buffer hit wins; fall through to leaf entry.
+  assigned per public mutating op (insert, delete, upsert).
+- Mutations become Messages: `Put { seq, value }`, `Delete { seq }`
+  (a tombstone while in transit), or `Upsert { seq, op }` (M2.1). Messages
+  live in internal-node buffers and migrate downward via flushes; leaves
+  store materialized entries only — `Put` sets the entry, `Delete` REMOVES
+  it outright, `Upsert` materializes per the upsert semantics below.
+  Leaves never store tombstones: the leaf is the authoritative bottom;
+  nothing exists below it.
+
+### Upsert semantics (M2.1, normative)
+
+Upserts are DATA, never code: `UpsertOp::Add(i64)` is the only operation
+(ADR-0011) — trace/replay determinism forbids user closures. Add is total:
+base = if the existing value is exactly 8 bytes, i64::from_le_bytes(it),
+else 0 (including absent and deleted). Result is always the 8-byte LE
+encoding of base.wrapping_add(delta). Wrapping, never panicking.
+
+### Coalescing (M2.1, normative)
+
+A buffer holds at most one effective message per key (I4); an arriving
+message coalesces with the resident one per this table
+("newer ∘ older = result"):
+
+    Put(v)    ∘ anything      = Put(v)
+    Delete    ∘ anything      = Delete
+    Upsert(d) ∘ Put(v)        = Put(apply(v, d))      [folds immediately]
+    Upsert(d) ∘ Delete        = Put(encode(d))        [base 0; folds]
+    Upsert(d) ∘ Upsert(d_old) = Upsert(Add(d_old.0.wrapping_add(d.0)))
+
+The result always carries the NEWER seq.
+
+### Reads (M2.1, replaces "topmost hit wins")
+
+`get` walks root→leaf accumulating a pending Upsert chain (a running
+wrapping i64 sum suffices for Add; by I3 everything higher is newer).
+Terminal cases: a buffered Put (apply the chain to its value), a buffered
+Delete (apply the chain to base 0 if the chain is non-empty, else None), a
+leaf entry (apply the chain), or leaf-absent (chain non-empty → the value
+of the chain from base 0; chain empty → None). An empty chain returns the
+terminal value untouched.
 
 ## Structure parameters (Params)
 
@@ -49,7 +87,10 @@ produce a single-child piece, and sorted insertion drives tree height to
 F = 2 (merges are delete-triggered; ADR-0002); a repair mechanism, if any,
 will be decided in M2. Engines must SURVIVE such trees — in particular, no
 operation may recurse proportionally to tree height — but performance under
-F = 2 is explicitly not promised.
+F = 2 is explicitly not promised. Reclamation v1 (M2.1) adds fanout-1
+internal nodes to the same degeneracy class: a parent reduced to a single
+child by leaf reclamation persists, and full occupancy-based rebalancing
+is explicitly out of scope for v1.
 
 ## Tree structure (M0.2)
 
@@ -60,14 +101,18 @@ A new engine is a single empty Leaf as root.
 ### Pivot convention (normative)
 
 An internal node with pivots p1 < p2 < ... < pk has k+1 children; child i
-owns keys in [p_{i-1}, p_i) with p_0 = -inf, p_{k+1} = +inf. A pivot always
-equals the smallest key of the subtree to its right. I1 is checked against
-this convention.
+owns keys in [p_{i-1}, p_i) with p_0 = -inf, p_{k+1} = +inf. A pivot
+equals the smallest key of the subtree to its right AT THE MOMENT OF THE
+SPLIT THAT PROMOTED IT. I1 is checked against this convention.
 
 Consequences: a key EQUAL to a pivot routes to the child on the pivot's
-right, and every pivot is a real key of the tree (a leaf split promotes the
-smallest key of its right piece; an internal split promotes an existing
-pivot, which moves up and is kept in neither half).
+right, and every pivot was a real key of the tree when promoted (a leaf
+split promotes the smallest key of its right piece; an internal split
+promotes an existing pivot, which moves up and is kept in neither half).
+Amended in M2.1: deletes can remove the key while the pivot persists, and
+reclamation's range absorption can detach a pivot from its subtree's
+minimum — pivots are pure half-open-range separators thereafter, which is
+all that routing and I1 ever rely on.
 
 ## Baseline flush policy (greedy-fullest, normative)
 
@@ -89,9 +134,39 @@ After the loop, the node itself splits if its fanout exceeds F. This named
 policy is the baseline that later milestones measure alternative flush
 policies against.
 
+## Reclamation v1 (M2.1, normative)
+
+- A flush delivery that leaves a leaf EMPTY signals removal upward: the
+  child-delivery result is either promoted splits or `Removed` — a single
+  delivery cannot both split and empty.
+- The parent of a removed child drops the child and its adjacent pivot
+  (the left pivot if one exists, else the right one); the neighbor absorbs
+  the emptied key range.
+- A parent reduced to a single child PERSISTS: fanout-1 internals are
+  legal (the same degeneracy class as F=2; see "Structure parameters").
+  Full occupancy-based rebalancing is explicitly out of scope for v1.
+- An internal node that loses EVERY child (its buffer is necessarily
+  drained by then) is itself `Removed`; if that node is the root, the tree
+  is the empty tree again — a fresh empty root leaf, the initial state.
+- Root collapse: after each public mutating op settles, while the root is
+  Internal with exactly one child AND an empty buffer, the child is
+  promoted to root. A non-empty root buffer is NOT force-flushed: a stale
+  tall root is harmless and collapses on a later op once its buffer
+  drains. A root leaf that empties simply IS the empty tree.
+- Removed nodes leak in the in-memory arena by design (ADR-0004
+  unchanged); on disk they are unreferenced by the next commit — CoW
+  handles it.
+- Consequence, checkable: invariant I7 — after a public mutating op
+  returns, no leaf is empty unless it is the root.
+- Caveat that follows from no-force-flush: deleting every key empties the
+  tree SEMANTICALLY at once (every get returns None), but up to B resting
+  tombstones per level move only on buffer overflow, so the structural
+  collapse to the empty root leaf may need further mutating ops to drive
+  them down (`src/betree.rs`, `delete_everything_collapses_to_the_empty_tree`).
+
 ## Invariants
 
-The real engine in M0.2 must uphold all of these; the checker walks the whole
+Every tree engine must uphold all of these; the checker walks the whole
 tree.
 
 - I1 Key ownership: every buffered message and leaf entry lies within the key
@@ -106,6 +181,8 @@ tree.
 - I5 Capacity at rest: after each public op returns, every buffer ≤ B, every
   leaf ≤ L, every fanout ≤ F. Transient overflow during an op is allowed.
 - I6 Uniform height: all leaves are at the same depth.
+- I7 No empty leaves at rest (M2.1): after a public mutating op returns, no
+  leaf is empty unless it is the root (SPEC "Reclamation v1").
 
 ## Public API additions (M1.1)
 
@@ -143,7 +220,23 @@ tree.
 In-memory semantics (P1–P5) are unchanged between commits; `DiskEngine`
 passes the frozen harness via a thin tempdir wrapper (`tests/disk.rs`).
 
-## On-disk format v1 (M1.1, normative)
+## Public API additions (M2.1)
+
+- `delete(&mut self, key)` and `upsert(&mut self, key, op: UpsertOp)` join
+  `KvEngine`. Both consume seqnos, are traced, and are replayed; deleting
+  an absent key is a legal no-op with a seqno.
+- `DiskEngine` gains the fallible twins `try_delete` / `try_upsert` with
+  the same error/poisoning semantics as `try_insert`.
+- The trace API is SPLIT (ADR-0013): the byte-frozen M0 harness matches
+  exhaustively over `TraceEvent`/`OpKind`, closing those enums, so the
+  full vocabulary lives in `TraceEvent2`/`OpKind2`. `trace()` keeps
+  returning the v1 view — faithful for insert-only workloads, silently
+  omitting deletes and upserts — and `trace2()` is the complete record;
+  `replay2` is the only replay that is faithful for mixed workloads.
+- `tests/harness2.rs` is the full-mix harness (Q1–Q5, mirroring P1–P5
+  over insert/delete/upsert/get); it freezes when M2.2 ships.
+
+## On-disk format v2 (M1.1, revised M2.1, normative)
 
 A database is one file. All integers are little-endian and fixed-width
 (bincode in the little-endian, fixed-int configuration; `usize` is encoded
@@ -159,7 +252,9 @@ bytes, followed by the CRC-32 of those 4092 bytes in the slot's final 4
 bytes (so every byte of the slot is covered). Fields, in order:
 
 - magic: 4 bytes, "BEET"
-- format_version: u32 = 1
+- format_version: u32 = 2 (bumped in M2.1: the Message encoding gained
+  Delete and Upsert variants; v1 files are refused with a typed
+  `UnsupportedVersion` error — no migration pre-release, ADR-0012)
 - params: F, B, L (u64 each) — persisted here so `open()` needs no
   out-of-band params; traces remain out-of-band (ADR-0006, as amended)
 - last_seq: u64 — seqno of the newest committed op; reopening continues
@@ -171,7 +266,10 @@ bytes (so every byte of the slot is covered). Fields, in order:
 - watermark: u64 — one past the end of valid data
 
 A slot is VALID iff magic, version, and crc all check and its geometry is
-sane (watermark and root_offset inside the data region, legal params).
+sane (watermark and root_offset inside the data region, legal params). A
+slot that authenticates (magic + crc) but carries a different
+format_version makes `open()` refuse the file with `UnsupportedVersion`
+(it IS a database, just not one this build reads; ADR-0012).
 `open()` additionally ignores a slot whose watermark exceeds the actual
 file length: data is synced before the superblock that points at it, so an
 honest slot can never outrun the file — one that does (external
@@ -197,7 +295,9 @@ is strictly below its parent's; loading enforces this (along with the I2
 arity k pivots ⇒ k+1 children), which keeps every walk over a
 hypothetically crc-colliding corrupt file finite and panic-free. Records
 are appended at the watermark and never modified in place (copy-on-write;
-ADR-0008). Nothing is reclaimed in M1: the file only grows.
+ADR-0008). Nothing is reclaimed on disk: the file only grows; nodes
+unlinked by Reclamation v1 (M2.1) are simply unreferenced by the next
+commit.
 
 ### Commit protocol
 
@@ -254,7 +354,7 @@ taken at each commit:
   whose commit had fully synced before the crash point (and never beyond
   the last attempted generation).
 - A4 — recovery is structurally sound: the recovered tree passes the full
-  I1–I6 invariant checker.
+  I1–I7 invariant checker.
 - A5 — recovery is live: the recovered engine accepts new operations,
   commits them, and survives a further reopen with the combined state —
   including seqno continuity (`last_seq`).
@@ -267,9 +367,9 @@ CRC verification must each make it fail.
 
 ## Out of scope in M0
 
-delete/tombstones, upserts, range scans, node merges (no deletes ⇒ no
-underflow; ADR-0002), persistence/disk (arrived in M1.1), concurrency,
-compression.
+delete/tombstones, upserts (both arrived in M2.1), range scans (M2.2),
+node merges (no deletes ⇒ no underflow; ADR-0002), persistence/disk
+(arrived in M1.1), concurrency, compression.
 
 ## Out of scope in M1.1
 
@@ -277,3 +377,9 @@ Write-ahead logging (permanently, by design; ADR-0007), auto-commit,
 crash *injection* (M1.2 hooks it into `Vfs`; ADR-0009), space
 reclamation/GC (ADR-0008 sketches the future path), cache eviction and
 memory budgets (M3 — loaded nodes stay resident).
+
+## Out of scope in M2.1
+
+Range scans (M2.2), occupancy-based rebalancing/merges beyond Reclamation
+v1, additional `UpsertOp` variants, on-disk space reclamation, freezing
+`tests/harness2.rs` (that happens when M2.2 ships).
