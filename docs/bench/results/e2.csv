@@ -1,0 +1,27 @@
+# git_commit: 4972e0d
+# rustc: rustc 1.96.0 (ac68faa20 2026-05-25)
+# cpu: AMD Ryzen 5 3600 6-Core Processor
+# ram: 16275076 kB
+# kernel: 6.8.0-124-generic
+# date: 2026-06-12T06:02:36Z
+# seed: 48879
+# reps: 3 (wall median/min/max; io_stats identical across reps by assertion)
+# caveats: page cache not defeated; engine-level I/O is the contract metric; single-threaded; CoW space unreclaimed
+# experiment: e2 read-amp vs cache budget
+# n_load: 1000000
+# n_reads: 200000
+# live_bytes: 53035988
+# budgets: pct of LIVE bytes, never file size
+distribution,budget_pct,read_ops,read_bytes,read_amp,hit_rate,evictions,overcommit,p50_us,p95_us,p99_us,wall_median_s,wall_min_s,wall_max_s
+uniform,unbounded,500558,41883200,13.0885,0.9264,0,0,3,10,14,0.8159,0.8147,0.8186
+uniform,50,607936,50829956,15.8844,0.9106,124815,0,4,10,14,0.9928,0.9924,1.0036
+uniform,25,956530,71498960,22.3434,0.8593,374983,0,7,11,14,1.4311,1.4195,1.4434
+uniform,10,1524088,96348052,30.1088,0.7759,714835,0,10,14,16,2.0179,2.0178,2.0208
+uniform,5,1974808,113347964,35.4212,0.7096,962106,0,12,17,19,2.4438,2.4383,2.4907
+uniform,2,2574250,134625888,42.0706,0.6214,1276351,0,15,20,24,3.0625,3.0525,3.0679
+zipfian,unbounded,330222,23834120,7.4482,0.9514,0,0,0,9,14,0.5299,0.5263,0.5309
+zipfian,50,330222,23834120,7.4482,0.9514,0,0,0,10,14,0.5618,0.5599,0.5668
+zipfian,25,398454,28178744,8.8059,0.9414,96042,0,0,10,14,0.6479,0.6474,0.6498
+zipfian,10,687574,43125096,13.4766,0.8989,296768,0,1,13,15,0.9750,0.9742,0.9751
+zipfian,5,1000494,57335896,17.9175,0.8529,475076,0,2,15,17,1.2925,1.2924,1.2925
+zipfian,2,1502904,78636580,24.5739,0.7790,740673,0,10,18,20,1.7189,1.7167,1.7226

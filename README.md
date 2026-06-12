@@ -19,7 +19,7 @@ honest benchmarks to back them.
 | M2.1 | Full message algebra — deletes (tombstones annihilate at leaves) and upserts (data, not code; ADR-0011) — plus Reclamation v1 and on-disk format v2 | done |
 | M2.2 | Range scans (bottom-up application; collect semantics, ADR-0014), the blind-increment showcase, harness2 freeze | done |
 | M3.1 | Measurement infrastructure: bounded node cache (lazy LRU, soft budget; ADR-0015), exact engine-level I/O accounting (`CountingVfs`), `drain()` | done |
-| M3.2 | Benchmarks | planned |
+| M3.2 | Benchmark suite: deterministic workloads, five experiments (E1–E5), RESULTS.md — within-engine only | done |
 
 ## Frozen harnesses
 
@@ -44,6 +44,27 @@ arms verified exactly against an oracle by one full scan):
 
 cache is unbounded in this build; the read-path gap widens under memory
 pressure (M3).
+
+## Results (M3.2)
+
+Within-engine characterization only — no comparisons to other engines.
+Full tables, setups, and caveats: [docs/bench/RESULTS.md](docs/bench/RESULTS.md);
+raw CSVs with provenance headers in `docs/bench/results/`. Headlines,
+each from its experiment:
+
+- **E1**: write amplification falls from 304.9× (commit every op; 84% of
+  bytes are superblock slots) to 7.2× (commit every 10,000) on 100k
+  16-byte inserts — never 1×: every commit rewrites the dirty spine
+  copy-on-write.
+- **E2**: at a cache budget of 10% of live bytes, 200k cold point reads
+  cost 30.1× read amplification uniform vs 13.5× Zipfian(0.99); the
+  Zipfian working set at a 50% budget evicts nothing at all.
+- **E5**: after 1M updates over 100k keys the file is 29.7× the live
+  data and growing linearly (~245 bytes/update) — the measured price of
+  no-WAL/no-GC (ADR-0007/0008).
+
+Caveats apply to every number: page cache not defeated (engine-level I/O
+is the contract metric), single-threaded, CoW space unreclaimed.
 
 ## Build & test
 

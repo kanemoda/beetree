@@ -22,6 +22,7 @@ mod node;
 pub mod trace;
 pub mod types;
 pub mod vfs;
+pub mod workload;
 
 pub use betree::BeTree;
 pub use disk::{CacheStats, CommitStats, DiskEngine, DiskError};

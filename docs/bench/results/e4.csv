@@ -1,0 +1,21 @@
+# git_commit: 4972e0d
+# rustc: rustc 1.96.0 (ac68faa20 2026-05-25)
+# cpu: AMD Ryzen 5 3600 6-Core Processor
+# ram: 16275076 kB
+# kernel: 6.8.0-124-generic
+# date: 2026-06-12T06:05:57Z
+# seed: 48879
+# reps: 3 (wall median/min/max; io_stats identical across reps by assertion)
+# caveats: page cache not defeated; engine-level I/O is the contract metric; single-threaded; CoW space unreclaimed
+# experiment: e4 mix suite (default params F=4/B=8/L=8; cache 10% live; commit/1000 on write mixes)
+# keyspace: 200000
+# n_ops: 500000
+# live_bytes: 10606360
+mix,throughput_ops_s,p50_us,p95_us,p99_us,read_ops,read_bytes,write_ops,write_bytes,hit_rate
+load,149439.6715,0,25,47,441988,67655828,1003,145032880,0.8179
+point-read,116004.1091,8,13,15,3749016,238735100,0,0,0.7501
+ycsb-a,88843.2653,4,21,37,2359534,288255476,1001,72000588,0.7150
+ycsb-b,76626.4811,10,17,21,3961250,296745084,1001,9670872,0.7186
+ycsb-c,112500.7106,9,13,16,3749016,238735100,0,0,0.7501
+upsert-heavy,130631.1477,0,29,47,1032200,125652532,1001,113735656,0.7307
+scan-mix,85809.5621,9,18,81,4679590,311291176,0,0,0.7039

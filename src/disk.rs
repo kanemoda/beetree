@@ -851,6 +851,54 @@ impl<V: Vfs> DiskEngine<V> {
         Ok(())
     }
 
+    /// Total serialized bytes of the LIVE (reachable) tree: a full walk
+    /// over the normal load path, summing each node's cache-accounted
+    /// size (exact record length for clean nodes — e.g. right after
+    /// `drain()` + `commit()` — estimated for dirty ones). PERTURBS THE
+    /// CACHE: every reachable node is faulted in and counts as accesses.
+    /// Benchmarks key cache budgets to THIS, never to file size, which is
+    /// mostly CoW garbage (SPEC "Observability"; E5 measures the gap).
+    pub fn live_bytes(&mut self) -> Result<u64, DiskError> {
+        Ok(self.live_walk()?.1)
+    }
+
+    /// Number of LIVE (reachable) nodes; same walk and caveats as
+    /// [`DiskEngine::live_bytes`].
+    pub fn live_node_count(&mut self) -> Result<u64, DiskError> {
+        Ok(self.live_walk()?.0)
+    }
+
+    /// Tree height (a lone root leaf is height 1): walks the leftmost
+    /// spine over the normal load path. Non-normative observability, like
+    /// `BeTree::height()`.
+    pub fn height(&mut self) -> Result<usize, DiskError> {
+        let mut height = 1;
+        let mut id = self.root;
+        self.ensure_loaded(id, &[])?;
+        while let Node::Internal { children, .. } = self.loaded(id) {
+            height += 1;
+            id = children[0];
+            self.ensure_loaded(id, &[])?;
+        }
+        Ok(height)
+    }
+
+    fn live_walk(&mut self) -> Result<(u64, u64), DiskError> {
+        let (mut nodes, mut bytes) = (0u64, 0u64);
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            self.ensure_loaded(id, &[])?;
+            nodes += 1;
+            if let NodeSlot::Loaded { bytes: b, .. } = &self.slots[id as usize] {
+                bytes += *b;
+            }
+            if let Node::Internal { children, .. } = self.loaded(id) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        Ok((nodes, bytes))
+    }
+
     /// Run the full I1–I7 checker regardless of the cache budget: suspend
     /// the budget, fault the whole tree in, check, then restore the
     /// budget and evict back down. The bounded-cache counterpart of the

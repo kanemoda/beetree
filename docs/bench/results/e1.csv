@@ -1,0 +1,17 @@
+# git_commit: 4972e0d
+# rustc: rustc 1.96.0 (ac68faa20 2026-05-25)
+# cpu: AMD Ryzen 5 3600 6-Core Processor
+# ram: 16275076 kB
+# kernel: 6.8.0-124-generic
+# date: 2026-06-12T06:01:40Z
+# seed: 48879
+# reps: 3 (wall median/min/max; io_stats identical across reps by assertion)
+# caveats: page cache not defeated; engine-level I/O is the contract metric; single-threaded; CoW space unreclaimed
+# experiment: e1 write-amp vs commit interval
+# n: 100000
+interval,logical_bytes,physical_write_bytes,write_amp,superblock_bytes,file_size,wall_median_s,wall_min_s,wall_max_s
+1,1600000,487861792,304.9136,409600000,78265888,161.0350,142.9253,162.2884
+10,1600000,86930380,54.3315,40960000,45974476,16.0498,14.4113,27.9782
+100,1600000,38010556,23.7566,4096000,33918652,6.3910,2.0190,10.9061
+1000,1600000,22782336,14.2390,409600,22376832,0.4721,0.4715,0.4725
+10000,1600000,11588860,7.2430,40960,11551996,0.2829,0.2794,0.2845

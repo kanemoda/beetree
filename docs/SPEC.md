@@ -1,8 +1,8 @@
-# beetree specification — M0 + M1 + M2 + M3.1
+# beetree specification — M0 + M1 + M2 + M3
 
 This document is normative for milestones M0 (in-memory engine), M1
 (persistence and crash safety), M2 (deletes, upserts, reclamation, range
-scans), and M3.1 (the bounded cache and observability).
+scans), and M3 (the bounded cache, observability, and benchmarks).
 The byte-frozen property-test harness in `tests/harness.rs` enforces the
 insert-only semantics mechanically; the full-mix harness in
 `tests/harness2.rs` (frozen when M2.2 ships) enforces the complete op
@@ -446,6 +446,21 @@ v1, additional `UpsertOp` variants, on-disk space reclamation, freezing
 - `check_invariants` (trait, `&self`) still requires full residency;
   bounded engines use `check_invariants_full(&mut self)`: suspend the
   budget, fault everything in, check I1–I7, re-enforce.
+- **Live-tree accounting** (M3.2): `live_bytes()` and
+  `live_node_count()` walk the reachable tree over the normal load path
+  (PERTURBING the cache) and sum per-node serialized sizes — exact for
+  clean nodes, estimated for dirty ones; `height()` walks the leftmost
+  spine. Benchmark cache budgets are expressed relative to LIVE bytes,
+  never file size: the file is mostly CoW garbage (E5 measures the gap)
+  and file-relative budgets would flatter the engine.
+- **Benchmarks** (M3.2): `src/workload.rs` provides seeded, deterministic
+  generators (SplitMix64; uniform/sequential/scrambled-Zipfian θ=0.99;
+  the named mixes load, point-read, ycsb-a/b/c, upsert-heavy, scan-mix);
+  `src/bin/bench.rs` runs the five experiments (E1–E5) and emits CSV with
+  a provenance header into docs/bench/results/. Within-engine
+  characterization only; results and caveats live in
+  docs/bench/RESULTS.md. ε appears only as the derived `eps_eff`
+  annotation (ADR-0016).
 - **drain()** (`DiskEngine` and `BeTree`) force-flushes every buffer
   until the tree is message-free: a benchmarking/analysis utility OUTSIDE
   the performance model; its internal flushes are NOT traced (no
@@ -465,3 +480,10 @@ eviction and memory budgets (M3).
 Benchmarks themselves (M3.2), eviction policies beyond lazy LRU, byte
 budgets for `BeTree`, write-back caching (forbidden by ADR-0007 as long
 as there is no WAL), defeating the OS page cache.
+
+## Out of scope in M3.2
+
+Comparisons to other engines (explicitly: within-engine characterization
+only), byte-budgeted nodes / a real ε knob (ADR-0016), defeating the OS
+page cache, multi-threaded benchmarks (the engine is single-threaded by
+design).
