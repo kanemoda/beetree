@@ -1,0 +1,10 @@
+# seed: 48879
+# n: 50000
+# keyspace: 20000
+# sample_rate: 8
+# window: 1000
+# params: F=4 B=8 L=8
+# base_decisions: 25061
+# coverage: 0.1224
+workload,interval,base_cost,improved_cost,gap_pct,decisions_total,decisions_sampled,wall
+ycsb-a,100,9520940,9432108,0.9330,24944,3054,86.8

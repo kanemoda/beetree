@@ -1,0 +1,10 @@
+# seed: 48879
+# n: 50000
+# keyspace: 20000
+# sample_rate: 8
+# window: 1000
+# params: F=4 B=8 L=8
+# base_decisions: 17099
+# coverage: 0.1208
+workload,interval,base_cost,improved_cost,gap_pct,decisions_total,decisions_sampled,wall
+ycsb-a-zipfian,100,6818220,6708296,1.6122,16884,2039,25.8

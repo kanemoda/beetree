@@ -19,6 +19,7 @@ pub mod engine;
 mod format;
 pub mod naive;
 mod node;
+pub mod policy;
 pub mod trace;
 pub mod types;
 pub mod vfs;
@@ -28,6 +29,7 @@ pub use betree::BeTree;
 pub use disk::{CacheStats, CommitStats, DiskEngine, DiskError};
 pub use engine::{EngineError, KvEngine};
 pub use naive::NaiveEngine;
+pub use policy::{FlushCtx, FlushPolicy, GreedyFullest};
 pub use trace::{OpKind, OpKind2, TraceEvent, TraceEvent2, from_jsonl, replay, replay2, to_jsonl};
 pub use types::{CapacityKind, InvariantViolation, Key, Message, Params, UpsertOp, Value};
 #[cfg(unix)]

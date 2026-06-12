@@ -14,10 +14,12 @@ use std::ops::Bound;
 
 use crate::check::{self, NodeSource};
 use crate::engine::{EngineError, KvEngine};
+use crate::format::{DiskNode, RECORD_HEADER_SIZE, SUPERBLOCK_SLOT_SIZE, encode_node};
 use crate::node::{
     Delivery, LeafEntry, Node, NodeId, Outcome, apply_chain, apply_to_leaf, bound_as_slice,
     clip_lower, clip_upper, coalesce_into, partition_sizes, range_is_empty, route,
 };
+use crate::policy::{FlushCtx, FlushPolicy, GreedyFullest, entry_bytes};
 use crate::trace::{OpKind2, Recorder, TraceEvent, TraceEvent2};
 use crate::types::{InvariantViolation, Key, Message, Params, UpsertOp, Value};
 
@@ -41,8 +43,21 @@ pub struct BeTree {
     /// nodes (emptied leaves, collapsed roots; M2.1) simply leak here
     /// (ADR-0004).
     nodes: Vec<Node>,
+    /// Simulated copy-on-write dirty flags, parallel to `nodes` (M4.1
+    /// analytic cost model): `dirty[id]` is set at exactly the points
+    /// where `DiskEngine` marks its slot dirty, and cleared by
+    /// [`BeTree::simulate_commit`] exactly as a real commit would.
+    /// Unreachable (leaked) nodes may keep stale flags; the commit walk
+    /// never visits them, mirroring disk (freed slots are never written).
+    dirty: Vec<bool>,
     root: NodeId,
     next_seq: u64,
+    /// Mutating ops since the last SIMULATED commit boundary — the
+    /// [`FlushCtx::ops_since_commit`] feed (M4.1).
+    ops_since_commit: u64,
+    /// The flush-child-choice policy (M4.1). [`GreedyFullest`] unless the
+    /// tree was built via [`BeTree::with_policy`]; `drain()` bypasses it.
+    policy: Box<dyn FlushPolicy>,
     trace: Recorder,
 }
 
@@ -84,8 +99,10 @@ impl BeTree {
     /// Force-flush every buffer until the whole tree is message-free
     /// (SPEC "Observability"): a benchmarking/analysis utility OUTSIDE
     /// the performance model. Its internal flushes are NOT traced — no
-    /// FlushDecision events (docs/findings.md) — so never call it
-    /// mid-workload when recording traces for policy analysis.
+    /// FlushDecision events (docs/findings.md) — and never consult the
+    /// installed [`FlushPolicy`] (forced flushes are not policy
+    /// decisions; M4.1) — so never call it mid-workload when recording
+    /// traces for policy analysis.
     pub fn drain(&mut self) {
         self.restore_root_with(0, false);
     }
@@ -93,7 +110,17 @@ impl BeTree {
     fn alloc(&mut self, node: Node) -> NodeId {
         let id = self.nodes.len() as NodeId;
         self.nodes.push(node);
+        // New nodes are born dirty, mirroring `DiskEngine::alloc_dirty`:
+        // they have never been written by a (simulated) commit.
+        self.dirty.push(true);
         id
+    }
+
+    /// Mark a node modified since the last simulated commit — placed at
+    /// exactly the sites where `DiskEngine` routes mutations through
+    /// `loaded_mut` (M4.1 cost model).
+    fn mark_dirty(&mut self, id: NodeId) {
+        self.dirty[id as usize] = true;
     }
 
     /// Re-establish capacity invariants at the root after a public
@@ -216,7 +243,11 @@ impl BeTree {
                 }
                 continue;
             }
-            let (chosen, child_id, child_occupancies, batch) = self.pick_and_extract(top);
+            // The cascade root is always the tree root, so the node's
+            // depth is its position in the flushing stack.
+            let depth = flushing.len() - 1;
+            let (chosen, child_id, child_occupancies, batch) =
+                self.pick_and_extract(top, depth, trace_flushes);
             if trace_flushes {
                 self.trace.flush_decision(top, child_occupancies, chosen);
             }
@@ -287,6 +318,7 @@ impl BeTree {
     /// degeneracy class as F=2); one reduced to zero children signals
     /// [`Outcome::Removed`] when it settles.
     fn remove_child(&mut self, parent: NodeId, child: NodeId) {
+        self.mark_dirty(parent);
         let Node::Internal {
             pivots, children, ..
         } = &mut self.nodes[parent as usize]
@@ -312,13 +344,58 @@ impl BeTree {
         }
     }
 
-    /// Greedy-fullest choice (`docs/SPEC.md`, "Baseline flush policy"):
-    /// pick the child with the most pending messages (lowest index on
-    /// ties) and remove every buffered message destined for it.
+    /// Choose a flush target and remove every buffered message destined
+    /// for it. In policy mode the installed [`FlushPolicy`] chooses from a
+    /// fresh [`FlushCtx`] ([`GreedyFullest`] by default — the normative
+    /// baseline, `docs/SPEC.md` "Baseline flush policy"); drain mode
+    /// (`policy_mode == false`) always applies the greedy rule directly,
+    /// because forced drain flushes are outside the performance model.
     fn pick_and_extract(
         &mut self,
         id: NodeId,
+        depth: usize,
+        policy_mode: bool,
     ) -> (usize, NodeId, Vec<usize>, BTreeMap<Key, Message>) {
+        // Phase 1 (read-only): assemble the decision context.
+        let (occupancies, ctx) = {
+            let Node::Internal {
+                pivots,
+                children,
+                buffer,
+            } = &self.nodes[id as usize]
+            else {
+                unreachable!("flush_overfull requires an internal node")
+            };
+            let mut occupancies = vec![0usize; children.len()];
+            let mut pending_bytes = vec![0u64; children.len()];
+            for (key, message) in buffer.iter() {
+                let child = route(pivots, key);
+                occupancies[child] += 1;
+                pending_bytes[child] += entry_bytes(key, message);
+            }
+            let ctx = policy_mode.then(|| FlushCtx {
+                node: id,
+                depth,
+                child_pending: occupancies.clone(),
+                child_pending_bytes: pending_bytes,
+                child_dirty: children.iter().map(|&c| self.dirty[c as usize]).collect(),
+                buffer_total: buffer.len(),
+                ops_since_commit: self.ops_since_commit,
+            });
+            (occupancies, ctx)
+        };
+        let chosen = match &ctx {
+            Some(ctx) => self.policy.choose(ctx),
+            None => GreedyFullest::pick(&occupancies),
+        };
+        assert!(
+            occupancies.get(chosen).is_some_and(|&count| count > 0),
+            "flush policy chose child {chosen} of node {id}, but only children with \
+             pending messages are legal targets (occupancies {occupancies:?})"
+        );
+        self.mark_dirty(id);
+        // Phase 2 (mutating): extraction, unchanged. The chosen child owns
+        // [pivots[chosen-1], pivots[chosen]).
         let Node::Internal {
             pivots,
             children,
@@ -327,18 +404,6 @@ impl BeTree {
         else {
             unreachable!("flush_overfull requires an internal node")
         };
-        let mut occupancies = vec![0usize; children.len()];
-        for key in buffer.keys() {
-            occupancies[route(pivots, key)] += 1;
-        }
-        // Strictly-greater scan keeps the lowest index on ties.
-        let mut chosen = 0;
-        for (i, &count) in occupancies.iter().enumerate() {
-            if count > occupancies[chosen] {
-                chosen = i;
-            }
-        }
-        // The chosen child owns [pivots[chosen-1], pivots[chosen]).
         let mut batch = match chosen.checked_sub(1) {
             Some(i) => buffer.split_off(pivots[i].as_slice()),
             None => mem::take(buffer),
@@ -360,6 +425,7 @@ impl BeTree {
         batch: BTreeMap<Key, Message>,
         threshold: usize,
     ) -> Delivery {
+        self.mark_dirty(child_id);
         match &mut self.nodes[child_id as usize] {
             Node::Leaf { entries } => {
                 for (key, message) in batch {
@@ -384,6 +450,7 @@ impl BeTree {
         if promoted.is_empty() {
             return;
         }
+        self.mark_dirty(id);
         let Node::Internal {
             pivots, children, ..
         } = &mut self.nodes[id as usize]
@@ -414,6 +481,7 @@ impl BeTree {
     }
 
     fn split_leaf(&mut self, id: NodeId) -> Vec<(Key, NodeId)> {
+        self.mark_dirty(id);
         let Node::Leaf { entries } = &mut self.nodes[id as usize] else {
             unreachable!("split_leaf requires a leaf")
         };
@@ -448,6 +516,7 @@ impl BeTree {
     }
 
     fn split_internal(&mut self, id: NodeId) -> Vec<(Key, NodeId)> {
+        self.mark_dirty(id);
         let Node::Internal {
             pivots,
             children,
@@ -520,6 +589,7 @@ impl BeTree {
     /// the root (leaf root: materialize; internal root: coalesce into the
     /// buffer, ADR-0003) and re-settle the tree.
     fn apply_root(&mut self, key: Key, message: Message) {
+        self.mark_dirty(self.root);
         match &mut self.nodes[self.root as usize] {
             Node::Leaf { entries } => apply_to_leaf(entries, key, message),
             Node::Internal { buffer, .. } => coalesce_into(buffer, key, message),
@@ -528,8 +598,12 @@ impl BeTree {
     }
 }
 
-impl KvEngine for BeTree {
-    fn new(params: Params) -> Self {
+impl BeTree {
+    /// A `BeTree` with an explicit flush policy (M4.1). `KvEngine::new`
+    /// is `with_policy(params, Box::new(GreedyFullest))` — the normative
+    /// baseline; non-default policies exist for offline policy analysis
+    /// (SPEC "Observability").
+    pub fn with_policy(params: Params, policy: Box<dyn FlushPolicy>) -> BeTree {
         assert!(
             params.fanout >= 2 && params.buffer_capacity >= 1 && params.leaf_capacity >= 1,
             "illegal Params (need F >= 2, B >= 1, L >= 1): {params:?}"
@@ -539,14 +613,131 @@ impl KvEngine for BeTree {
             nodes: vec![Node::Leaf {
                 entries: BTreeMap::new(),
             }],
+            // The initial root has never been (simulated-)committed,
+            // exactly as `DiskEngine::create_on` builds its root dirty.
+            dirty: vec![true],
             root: 0,
             next_seq: 0,
+            ops_since_commit: 0,
+            policy,
             trace: Recorder::default(),
         }
     }
 
+    /// Simulate one commit boundary of the analytic cost model (M4.1):
+    /// the exact bytes a `DiskEngine::commit` would write for the current
+    /// dirty set — `Σ over dirty nodes (8-byte record header + the real
+    /// bincode payload length) + 4096` for the superblock slot — then
+    /// mark everything clean and reset `ops_since_commit`, as a real
+    /// commit would. The dirty walk follows dirty-only edges from the
+    /// root, mirroring `commit_inner` (unlinked nodes are unreachable and
+    /// never charged, like freed slots). A run that calls this every K
+    /// ops, starting with one call at construction (mirroring `create`'s
+    /// durable generation 0), is calibrated to match `CountingVfs` write
+    /// bytes on an identical `DiskEngine` run (`tests/cost_model.rs`).
+    pub fn simulate_commit(&mut self) -> u64 {
+        let mut pre: Vec<NodeId> = Vec::new();
+        if self.dirty[self.root as usize] {
+            let mut visit = vec![self.root];
+            while let Some(id) = visit.pop() {
+                pre.push(id);
+                if let Node::Internal { children, .. } = &self.nodes[id as usize] {
+                    visit.extend(children.iter().copied().filter(|&c| self.dirty[c as usize]));
+                }
+            }
+        }
+        let mut bytes = 0;
+        for &id in &pre {
+            bytes += RECORD_HEADER_SIZE + self.record_payload_len(id);
+            self.dirty[id as usize] = false;
+        }
+        self.ops_since_commit = 0;
+        bytes + SUPERBLOCK_SLOT_SIZE
+    }
+
+    /// The node's exact on-disk record payload length: the real bincode
+    /// encoding of its `DiskNode` form. Child arena ids stand in for the
+    /// child record offsets — both are fixed-width u64s, so the length is
+    /// identical (the cost model never needs the actual offsets).
+    fn record_payload_len(&self, id: NodeId) -> u64 {
+        let disk_node = match &self.nodes[id as usize] {
+            Node::Leaf { entries } => DiskNode::Leaf {
+                entries: entries.clone(),
+            },
+            Node::Internal {
+                pivots,
+                children,
+                buffer,
+            } => DiskNode::Internal {
+                pivots: pivots.clone(),
+                children: children.clone(),
+                buffer: buffer.clone(),
+            },
+        };
+        encode_node(&disk_node)
+            .expect("in-memory bincode encoding cannot fail")
+            .len() as u64
+    }
+
+    /// A deep copy of the LIVE tree for simulation (M4.1 rollout oracle):
+    /// reachable nodes only, compacted to fresh arena ids (the arena
+    /// leaks by design — ADR-0004 — and rollouts fork at every evaluated
+    /// alternative, so copying leaked slots would make forking
+    /// O(history)). Carries the logical state a rollout needs — contents,
+    /// dirty flags, `next_seq`, `ops_since_commit` — under the given
+    /// policy, with an EMPTY trace. Node ids in the fork's `FlushCtx`s
+    /// and trace are fork-local (they were never stable identifiers;
+    /// docs/findings.md).
+    pub fn fork_for_sim(&self, policy: Box<dyn FlushPolicy>) -> BeTree {
+        let mut order: Vec<NodeId> = Vec::new();
+        let mut map: BTreeMap<NodeId, NodeId> = BTreeMap::new();
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            map.insert(id, order.len() as NodeId);
+            order.push(id);
+            if let Node::Internal { children, .. } = &self.nodes[id as usize] {
+                stack.extend(children.iter().copied());
+            }
+        }
+        let nodes = order
+            .iter()
+            .map(|&id| match &self.nodes[id as usize] {
+                Node::Leaf { entries } => Node::Leaf {
+                    entries: entries.clone(),
+                },
+                Node::Internal {
+                    pivots,
+                    children,
+                    buffer,
+                } => Node::Internal {
+                    pivots: pivots.clone(),
+                    children: children.iter().map(|c| map[c]).collect(),
+                    buffer: buffer.clone(),
+                },
+            })
+            .collect();
+        let dirty = order.iter().map(|&id| self.dirty[id as usize]).collect();
+        BeTree {
+            params: self.params,
+            nodes,
+            dirty,
+            root: map[&self.root],
+            next_seq: self.next_seq,
+            ops_since_commit: self.ops_since_commit,
+            policy,
+            trace: Recorder::default(),
+        }
+    }
+}
+
+impl KvEngine for BeTree {
+    fn new(params: Params) -> Self {
+        BeTree::with_policy(params, Box::new(GreedyFullest))
+    }
+
     fn insert(&mut self, key: Key, value: Value) {
         self.next_seq += 1;
+        self.ops_since_commit += 1;
         let seq = self.next_seq;
         self.trace.op(
             seq,
@@ -560,6 +751,7 @@ impl KvEngine for BeTree {
 
     fn delete(&mut self, key: Key) {
         self.next_seq += 1;
+        self.ops_since_commit += 1;
         let seq = self.next_seq;
         self.trace.op(seq, OpKind2::Delete { key: key.clone() });
         self.apply_root(key, Message::Delete { seq });
@@ -567,6 +759,7 @@ impl KvEngine for BeTree {
 
     fn upsert(&mut self, key: Key, op: UpsertOp) {
         self.next_seq += 1;
+        self.ops_since_commit += 1;
         let seq = self.next_seq;
         self.trace.op(
             seq,

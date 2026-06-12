@@ -20,6 +20,7 @@ honest benchmarks to back them.
 | M2.2 | Range scans (bottom-up application; collect semantics, ADR-0014), the blind-increment showcase, harness2 freeze | done |
 | M3.1 | Measurement infrastructure: bounded node cache (lazy LRU, soft budget; ADR-0015), exact engine-level I/O accounting (`CountingVfs`), `drain()` | done |
 | M3.2 | Benchmark suite: deterministic workloads, five experiments (E1–E5), RESULTS.md — within-engine only | done |
+| M4.1 | Phase-2 falsification: `FlushPolicy` trait (byte-identical refactor), exact analytic cost model, hindsight rollout oracle, the optimality-gap grid and verdict (docs/analysis/FALSIFICATION.md) | done |
 
 ## Frozen harnesses
 

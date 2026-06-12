@@ -31,6 +31,7 @@ use crate::node::{
     Delivery, LeafEntry, Node, NodeId, Outcome, apply_chain, apply_to_leaf, bound_as_slice,
     clip_lower, clip_upper, coalesce_into, partition_sizes, range_is_empty, route,
 };
+use crate::policy::{FlushCtx, FlushPolicy, GreedyFullest, entry_bytes};
 use crate::trace::{OpKind2, Recorder, TraceEvent, TraceEvent2};
 use crate::types::{InvariantViolation, Key, Message, Params, UpsertOp, Value};
 use crate::vfs::Vfs;
@@ -103,7 +104,10 @@ pub struct CommitStats {
     /// Dirty nodes serialized to new records (copy-on-write).
     pub nodes_written: usize,
     /// Total bytes written: appended node records plus the 4096-byte
-    /// superblock slot.
+    /// superblock slot. Computed from the serialized buffer, NOT observed
+    /// at the storage layer — never use it as the physical side of a
+    /// cost-model calibration (that is `CountingVfs`'s job; it would be
+    /// circular here).
     pub bytes_written: u64,
 }
 
@@ -249,6 +253,13 @@ pub struct DiskEngine<V: Vfs> {
     /// duplicates (ADR-0015) — without this, the arena would grow per
     /// miss and resident children would be double-counted.
     offsets: BTreeMap<u64, NodeId>,
+    /// Mutating ops since the last commit — the
+    /// [`FlushCtx::ops_since_commit`] feed (M4.1).
+    ops_since_commit: u64,
+    /// The flush-child-choice policy (M4.1). [`GreedyFullest`] unless
+    /// constructed via a `*_with_policy` constructor; `drain()` bypasses
+    /// it.
+    policy: Box<dyn FlushPolicy>,
     trace: Recorder,
 }
 
@@ -328,20 +339,32 @@ impl<V: Vfs> DiskEngine<V> {
     /// [`create`](DiskEngine::create) over an arbitrary [`Vfs`] (the M1.2
     /// fault-injection entry point). The node cache is unbounded.
     pub fn create_on(vfs: V, params: Params) -> Result<Self, DiskError> {
-        Self::create_on_with(vfs, params, None)
+        Self::create_on_with(vfs, params, None, None)
     }
 
     /// [`create_on`](DiskEngine::create_on) with a node-cache budget in
     /// bytes (SPEC "Observability"; ADR-0015). The budget is a soft
     /// target: pinned and dirty nodes are never evicted.
     pub fn create_on_bounded(vfs: V, params: Params, cache_budget: u64) -> Result<Self, DiskError> {
-        Self::create_on_with(vfs, params, Some(cache_budget))
+        Self::create_on_with(vfs, params, Some(cache_budget), None)
+    }
+
+    /// [`create_on`](DiskEngine::create_on) with an explicit flush policy
+    /// (M4.1; SPEC "Observability"). The plain constructors default to
+    /// [`GreedyFullest`], the normative baseline.
+    pub fn create_on_with_policy(
+        vfs: V,
+        params: Params,
+        policy: Box<dyn FlushPolicy>,
+    ) -> Result<Self, DiskError> {
+        Self::create_on_with(vfs, params, None, Some(policy))
     }
 
     fn create_on_with(
         vfs: V,
         params: Params,
         cache_budget: Option<u64>,
+        policy: Option<Box<dyn FlushPolicy>>,
     ) -> Result<Self, DiskError> {
         assert!(
             params.fanout >= 2 && params.buffer_capacity >= 1 && params.leaf_capacity >= 1,
@@ -377,6 +400,8 @@ impl<V: Vfs> DiskEngine<V> {
                 ..Cache::default()
             },
             offsets: BTreeMap::new(),
+            ops_since_commit: 0,
+            policy: policy.unwrap_or_else(|| Box::new(GreedyFullest)),
             trace: Recorder::default(),
         };
         engine.touch(0);
@@ -387,16 +412,27 @@ impl<V: Vfs> DiskEngine<V> {
     /// [`open`](DiskEngine::open) over an arbitrary [`Vfs`]. The node
     /// cache is unbounded.
     pub fn open_on(vfs: V) -> Result<Self, DiskError> {
-        Self::open_on_with(vfs, None)
+        Self::open_on_with(vfs, None, None)
     }
 
     /// [`open_on`](DiskEngine::open_on) with a node-cache budget in bytes
     /// (SPEC "Observability"; ADR-0015).
     pub fn open_on_bounded(vfs: V, cache_budget: u64) -> Result<Self, DiskError> {
-        Self::open_on_with(vfs, Some(cache_budget))
+        Self::open_on_with(vfs, Some(cache_budget), None)
     }
 
-    fn open_on_with(mut vfs: V, cache_budget: Option<u64>) -> Result<Self, DiskError> {
+    /// [`open_on`](DiskEngine::open_on) with an explicit flush policy
+    /// (M4.1; SPEC "Observability"). The plain constructors default to
+    /// [`GreedyFullest`], the normative baseline.
+    pub fn open_on_with_policy(vfs: V, policy: Box<dyn FlushPolicy>) -> Result<Self, DiskError> {
+        Self::open_on_with(vfs, None, Some(policy))
+    }
+
+    fn open_on_with(
+        mut vfs: V,
+        cache_budget: Option<u64>,
+        policy: Option<Box<dyn FlushPolicy>>,
+    ) -> Result<Self, DiskError> {
         let file_len = vfs.len()?;
         let mut best: Option<Superblock> = None;
         let mut wrong_version: Option<u32> = None;
@@ -454,6 +490,8 @@ impl<V: Vfs> DiskEngine<V> {
                 ..Cache::default()
             },
             offsets: BTreeMap::from([(sb.root_offset, 0 as NodeId)]),
+            ops_since_commit: 0,
+            policy: policy.unwrap_or_else(|| Box::new(GreedyFullest)),
             trace: Recorder::default(),
         })
     }
@@ -599,6 +637,7 @@ impl<V: Vfs> DiskEngine<V> {
         // exact record lengths): the commit boundary is the natural point
         // to settle back under the budget.
         self.enforce_budget(&[], None);
+        self.ops_since_commit = 0;
         Ok(CommitStats {
             nodes_written,
             bytes_written: buf.len() as u64 + SUPERBLOCK_SLOT_SIZE,
@@ -614,6 +653,7 @@ impl<V: Vfs> DiskEngine<V> {
     pub fn try_insert(&mut self, key: Key, value: Value) -> Result<(), DiskError> {
         self.ensure_loaded(self.root, &[])?;
         self.next_seq += 1;
+        self.ops_since_commit += 1;
         let seq = self.next_seq;
         self.trace.op(
             seq,
@@ -630,6 +670,7 @@ impl<V: Vfs> DiskEngine<V> {
     pub fn try_delete(&mut self, key: Key) -> Result<(), DiskError> {
         self.ensure_loaded(self.root, &[])?;
         self.next_seq += 1;
+        self.ops_since_commit += 1;
         let seq = self.next_seq;
         self.trace.op(seq, OpKind2::Delete { key: key.clone() });
         self.apply_root(key, Message::Delete { seq })
@@ -641,6 +682,7 @@ impl<V: Vfs> DiskEngine<V> {
     pub fn try_upsert(&mut self, key: Key, op: UpsertOp) -> Result<(), DiskError> {
         self.ensure_loaded(self.root, &[])?;
         self.next_seq += 1;
+        self.ops_since_commit += 1;
         let seq = self.next_seq;
         self.trace.op(
             seq,
@@ -1309,8 +1351,10 @@ impl<V: Vfs> DiskEngine<V> {
     /// Force-flush every buffer until the whole tree is message-free
     /// (SPEC "Observability"): a benchmarking/analysis utility OUTSIDE
     /// the performance model. Its internal flushes are NOT traced — no
-    /// FlushDecision events (docs/findings.md) — so never call it
-    /// mid-workload when recording traces for policy analysis. A flush
+    /// FlushDecision events (docs/findings.md) — and never consult the
+    /// installed [`FlushPolicy`] (forced flushes are not policy
+    /// decisions; M4.1) — so never call it mid-workload when recording
+    /// traces for policy analysis. A flush
     /// threshold of zero turns the ordinary cascade into a full drain:
     /// every delivery that lands anything in a child buffer recurses
     /// until the messages reach the leaves; the until-fixpoint pass
@@ -1463,7 +1507,11 @@ impl<V: Vfs> DiskEngine<V> {
                 }
                 continue;
             }
-            let (chosen, child_id, child_occupancies, batch) = self.pick_and_extract(top);
+            // The cascade root is always the tree root, so the node's
+            // depth is its position in the flushing stack.
+            let depth = flushing.len() - 1;
+            let (chosen, child_id, child_occupancies, batch) =
+                self.pick_and_extract(top, depth, trace_flushes);
             if trace_flushes {
                 self.trace.flush_decision(top, child_occupancies, chosen);
             }
@@ -1568,33 +1616,67 @@ impl<V: Vfs> DiskEngine<V> {
         }
     }
 
-    /// Greedy-fullest choice (`docs/SPEC.md`, "Baseline flush policy"):
-    /// pick the child with the most pending messages (lowest index on
-    /// ties) and remove every buffered message destined for it.
+    /// Choose a flush target and remove every buffered message destined
+    /// for it. In policy mode the installed [`FlushPolicy`] chooses from a
+    /// fresh [`FlushCtx`] ([`GreedyFullest`] by default — the normative
+    /// baseline, `docs/SPEC.md` "Baseline flush policy"); drain mode
+    /// (`policy_mode == false`) always applies the greedy rule directly,
+    /// because forced drain flushes are outside the performance model.
+    /// The flushing node is resident (mid-flush); its children need not
+    /// be — an unloaded child is clean by definition.
     fn pick_and_extract(
         &mut self,
         id: NodeId,
+        depth: usize,
+        policy_mode: bool,
     ) -> (usize, NodeId, Vec<usize>, BTreeMap<Key, Message>) {
+        // Phase 1 (read-only): assemble the decision context.
+        let (occupancies, ctx) = {
+            let Node::Internal {
+                pivots,
+                children,
+                buffer,
+            } = self.loaded(id)
+            else {
+                unreachable!("flush_overfull requires an internal node")
+            };
+            let mut occupancies = vec![0usize; children.len()];
+            let mut pending_bytes = vec![0u64; children.len()];
+            for (key, message) in buffer.iter() {
+                let child = route(pivots, key);
+                occupancies[child] += 1;
+                pending_bytes[child] += entry_bytes(key, message);
+            }
+            let ctx = policy_mode.then(|| FlushCtx {
+                node: id,
+                depth,
+                child_pending: occupancies.clone(),
+                child_pending_bytes: pending_bytes,
+                child_dirty: children.iter().map(|&c| self.is_dirty(c)).collect(),
+                buffer_total: buffer.len(),
+                ops_since_commit: self.ops_since_commit,
+            });
+            (occupancies, ctx)
+        };
+        let chosen = match &ctx {
+            Some(ctx) => self.policy.choose(ctx),
+            None => GreedyFullest::pick(&occupancies),
+        };
+        assert!(
+            occupancies.get(chosen).is_some_and(|&count| count > 0),
+            "flush policy chose child {chosen} of node {id}, but only children with \
+             pending messages are legal targets (occupancies {occupancies:?})"
+        );
+        // Phase 2 (mutating): extraction, unchanged. The chosen child owns
+        // [pivots[chosen-1], pivots[chosen]).
         let Node::Internal {
             pivots,
             children,
             buffer,
         } = self.loaded_mut(id)
         else {
-            unreachable!("flush_overfull requires an internal node")
+            unreachable!("checked above")
         };
-        let mut occupancies = vec![0usize; children.len()];
-        for key in buffer.keys() {
-            occupancies[route(pivots, key)] += 1;
-        }
-        // Strictly-greater scan keeps the lowest index on ties.
-        let mut chosen = 0;
-        for (i, &count) in occupancies.iter().enumerate() {
-            if count > occupancies[chosen] {
-                chosen = i;
-            }
-        }
-        // The chosen child owns [pivots[chosen-1], pivots[chosen]).
         let mut batch = match chosen.checked_sub(1) {
             Some(i) => buffer.split_off(pivots[i].as_slice()),
             None => mem::take(buffer),

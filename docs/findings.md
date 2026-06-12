@@ -134,6 +134,59 @@ their kills probabilistic or impossible:
    superblock write at every 4-byte field boundary (0..=72, plus padding
    and near-crc points), making the splice deterministic.
 
+## M4.1 adversarial review (oracle, calibration, falsification doc)
+
+Multi-agent review of the M4.1 milestone. Attacks that found NOTHING
+(named, because absence of evidence only counts when the attack does):
+a 626-config differential battery main-vs-m4.1 under the default policy
+(edge params down to F=2/B=1/L=1, reclamation/root-collapse/empty-tree,
+drain interplay, reopen mid-workload, occupancy-tie orderings — zero
+trace/file divergences; the stored regression constants reproduce on
+pre-refactor main); 40+ calibration edge probes incl. delete-to-empty
+cycles, K=1, K>N, dirty-chasing policies, bounded-cache eviction
+pressure (analytic == physical exactly, everywhere); independent
+end-to-end replay of the 13.47% cell (base/improved integers reproduce
+exactly; all 2,633 logged FlushCtx match a fresh replay); determinism
+double-runs byte-identical to the committed logs; 149,496 committed log
+records with zero schema/argmin/sampler violations.
+
+26. **Oracle test suite blind to a rollout-window off-by-one (mutant
+    survived)** (major) — fixed post-review: `end = i + W` instead of
+    `i + 1 + W` passed all 5 oracle tests (the dirty-spine scenario's
+    1-op workload clamps the horizon, making window extent
+    unobservable). Killed by the new
+    `rollout_window_covers_exactly_the_trigger_plus_w_ops` (clean-tree
+    read-op rollout at K=1: total must be (W+2)·4096; mutant gives
+    (W+1)·4096 — observed kill 45056 vs 49152).
+27. **Oracle test suite blind to a commit-boundary phase off-by-one in
+    `rollout_cost` (mutant survived, and it CHANGES oracle decisions)**
+    (major) — fixed post-review: `(m) % K` for `(m+1) % K` shifted every
+    alternative's window cost by a uniform +4096, which cancels in the
+    cost DIFFERENCE the dirty-spine test asserted; on a discriminator
+    workload the mutant changed the improved trajectory itself (script
+    83 vs 90, cost 75272 vs 75140) with the suite silent. Killed by
+    pinning the ABSOLUTE window costs in the dirty-spine test (4476 and
+    4728; mutant gives 8572/8824 — observed kill).
+28. **Four mechanism-reading claims in FALSIFICATION.md did not
+    reproduce from the committed logs** (major) — fixed in the doc:
+    "3–4× everywhere" (measured 2.4–4.1×), ">half both-dirty at
+    K=1000" (measured 40–54%), "~10× summed-savings overstatement"
+    (measured 0.63–9.5×, one cell understates), "no cell exceeds 7.2%
+    at full coverage" (only 3 of 12 default rows were measured at S=1).
+29. **Verdict green-lit M4.2 against the registered rule's own
+    anti-softening clause, using runs outside the registered grid**
+    (major) — fixed: verdict renamed "Interim verdict", reframed as a
+    diagnosed-instrument amendment + CONDITIONAL green light, and a
+    fresh-seed confirmation experiment was pre-registered
+    (FALSIFICATION.md, "Confirmation experiment (re-registered)").
+30. **Calibration byte-exactness is partly shared-by-construction**
+    (minor) — fixed (wording): both accounting paths price payloads
+    with the same `encode_node`, so the calibration's falsifiable
+    content is the dirty-set/tree-evolution mirror (independent
+    implementations) counted at the VFS boundary; scoped in
+    `tests/cost_model.rs` and FALSIFICATION.md, with a circularity
+    warning on `CommitStats::bytes_written`.
+
 ## Deferred decisions
 
 - **v1 trace retirement + harness re-baseline** (recorded M2.2): the v1
@@ -144,6 +197,17 @@ their kills probabilistic or impossible:
   harness — new file, new hash, recorded rationale — and is deferred to a
   polish milestone so it can ride along with any other accumulated
   freeze-debt in a single, auditable break.
+- **Full-coverage (S=1) measurement exists for only three of the twelve
+  default-param grid rows** (recorded M4.1 review): uniform-load (2.35%
+  at S=8, the second-highest default cell) and upsert-heavy (1.78%)
+  were never rerun at S=1, so the "no default cell exceeds 7.2% at full
+  coverage" bound is established only for the measured rows. Filling
+  the gap is cheap (~10 min/cell) if a later milestone needs the bound
+  to be grid-wide.
+- **The flush-TIMING action space is unmeasured** (recorded M4.1): the
+  oracle's action space is child choice at the baseline's trigger
+  points; early/held/batched flushes need their own falsification
+  before anything is built on them (FALSIFICATION.md, caveat 1).
 - **drain() is deliberately invisible to traces** (recorded M3.1): the
   frozen-matched trace enums cannot gain a Drain/FlushDecision-suppressing
   variant (CLAUDE.md standing rule, learned from ADR-0013), and drain is in

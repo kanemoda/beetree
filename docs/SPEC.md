@@ -1,8 +1,9 @@
-# beetree specification — M0 + M1 + M2 + M3
+# beetree specification — M0 + M1 + M2 + M3 + M4.1
 
 This document is normative for milestones M0 (in-memory engine), M1
 (persistence and crash safety), M2 (deletes, upserts, reclamation, range
-scans), and M3 (the bounded cache, observability, and benchmarks).
+scans), M3 (the bounded cache, observability, and benchmarks), and M4.1
+(the pluggable flush policy and its measurement apparatus).
 The byte-frozen property-test harness in `tests/harness.rs` enforces the
 insert-only semantics mechanically; the full-mix harness in
 `tests/harness2.rs` (frozen when M2.2 ships) enforces the complete op
@@ -166,6 +167,16 @@ After the loop, the node itself splits if its fanout exceeds F. This named
 policy is the baseline that later milestones measure alternative flush
 policies against.
 
+Since M4.1 the child choice in step 1 is pluggable: engines take a
+`FlushPolicy` at construction ("Public API additions (M4.1)") and
+`GreedyFullest` — this exact rule, tie-break included — is every
+constructor's default, so default-constructed engines are unchanged down
+to the byte (`tests/policy_regression.rs` pins pre-refactor trace and
+file hashes). A policy must choose a child with at least one pending
+message; engines panic on any other choice. `drain()` never consults the
+policy: its forced flushes are outside the performance model
+("Observability").
+
 ## Reclamation v1 (M2.1, normative)
 
 - A flush delivery that leaves a leaf EMPTY signals removal upward: the
@@ -271,6 +282,40 @@ passes the frozen harness via a thin tempdir wrapper (`tests/disk.rs`).
   extending P1–P5 over insert/delete/upsert/get/scan); FROZEN as of M2.2
   — byte-identical from here on, hash in the README freeze table beside
   `tests/harness.rs`.
+
+## Public API additions (M4.1)
+
+- `FlushPolicy` / `FlushCtx` / `GreedyFullest` (`src/policy.rs`): the
+  flush-child choice is a trait. [`FlushCtx`] carries, per decision: the
+  flushing node's id and depth (0 = root), per-child pending message
+  counts (exactly the trace event's `child_occupancies`), per-child
+  pending byte estimates (the exact bincode size of each buffered entry,
+  summed per child), per-child dirty flags (would a commit taken now
+  rewrite this child — the CoW dirty bit on `DiskEngine`, its simulated
+  mirror on `BeTree`), the buffer total, and `ops_since_commit` —
+  MUTATING ops since the last commit boundary (real commits on
+  `DiskEngine`, simulated boundaries on `BeTree`). The last field is the
+  decision's position in the commit window, on which the CoW-granularity
+  tax (the "dirty-spine discount") depends. The unchanged
+  `FlushDecision` trace event records every decision either way.
+- `BeTree::with_policy(params, policy)`,
+  `DiskEngine::create_on_with_policy(vfs, params, policy)` and
+  `DiskEngine::open_on_with_policy(vfs, policy)` install an explicit
+  policy at construction; every pre-existing constructor defaults to
+  `GreedyFullest`.
+- `BeTree` analytic cost accounting (non-normative analysis surface,
+  like `height()`): `simulate_commit()` returns the exact bytes a
+  `DiskEngine::commit` would write for the current state — Σ over dirty
+  nodes (8-byte record header + real bincode payload) + 4096 for the
+  superblock slot — then marks the tree clean and zeroes
+  `ops_since_commit`, exactly as a real commit would. Dirty flags mirror
+  the disk engine's marking sites one for one; the equivalence is
+  calibrated byte-exact against `CountingVfs` write bytes
+  (`tests/cost_model.rs`), and the whole M4.1 falsification phase rests
+  on it. `fork_for_sim(policy)` deep-copies the LIVE tree (reachable
+  nodes only, compacted ids, empty trace) carrying contents, dirty
+  flags, `next_seq`, and `ops_since_commit` — the rollout oracle's
+  forking primitive.
 
 ## On-disk format v2 (M1.1, revised M2.1, normative)
 
@@ -466,7 +511,29 @@ v1, additional `UpsertOp` variants, on-disk space reclamation, freezing
   the performance model; its internal flushes are NOT traced (no
   FlushDecision events) — never call it mid-workload when recording
   traces for policy analysis. (It cannot be traced even in principle
-  without growing the frozen vocabulary; docs/findings.md.)
+  without growing the frozen vocabulary; docs/findings.md.) Since M4.1
+  it also never consults the installed `FlushPolicy`: forced drain
+  flushes always use the greedy rule.
+- **Flush-decision logs** (M4.1): `src/bin/oracle.rs` — the hindsight
+  rollout oracle (`docs/analysis/FALSIFICATION.md`) — emits a VERSIONED
+  JSONL decision log, the designated training-data format for any future
+  learned policy. Line 1 is a header object: `schema_version` (currently
+  1), `kind` (`"beetree-flush-decision-log"`), `seed`, `workload`,
+  `n_ops`, `keyspace`, `commit_interval`, `sample_rate`, `window`,
+  `params`, and prose `sampler` / `cost_model` definitions pinning the
+  semantics of the numbers. Every following line is one sampled
+  decision: `op_index` (workload op containing the decision),
+  `decision_index` (global decision counter on the improved trajectory),
+  `ctx` (the full serialized `FlushCtx`, `ops_since_commit` included),
+  `alternatives` (`[{child, window_cost}]` over every legal child — the
+  measured rollout cost labels), `chosen` (the oracle's argmin; ties
+  prefer the greedy choice, then the lowest index), and `greedy_choice`
+  (what the baseline would have done). Any future field change bumps
+  `schema_version` — formats never silently mix. The oracle's CSV row is
+  `(workload, interval, base_cost, improved_cost, gap_pct,
+  decisions_total, decisions_sampled, wall)`; the grid, the
+  pre-registered decision rule, and the verdict live in
+  `docs/analysis/FALSIFICATION.md`.
 
 ## Out of scope in M2.2
 

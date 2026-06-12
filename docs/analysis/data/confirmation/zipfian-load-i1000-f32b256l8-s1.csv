@@ -1,0 +1,10 @@
+# seed: 271828
+# n: 50000
+# keyspace: 20000
+# sample_rate: 1
+# window: 1000
+# params: F=32 B=256 L=8
+# base_decisions: 1340
+# coverage: 1.0000
+workload,interval,base_cost,improved_cost,gap_pct,decisions_total,decisions_sampled,wall
+zipfian-load,1000,9349632,8351400,10.6767,1801,1801,93.9

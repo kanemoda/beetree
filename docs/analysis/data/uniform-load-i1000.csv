@@ -1,0 +1,10 @@
+# seed: 48879
+# n: 50000
+# keyspace: 20000
+# sample_rate: 8
+# window: 1000
+# params: F=4 B=8 L=8
+# base_decisions: 54104
+# coverage: 0.1241
+workload,interval,base_cost,improved_cost,gap_pct,decisions_total,decisions_sampled,wall
+uniform-load,1000,8815424,8608300,2.3496,54146,6717,221.9
